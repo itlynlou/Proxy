@@ -1,0 +1,16 @@
+{
+  "name": "janitor-nim-proxy",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible proxy for Janitor AI using NVIDIA NIM's free models, with normalized thinking-mode support.",
+  "type": "module",
+  "main": "api/index.js",
+  "scripts": {
+    "start": "node api/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
