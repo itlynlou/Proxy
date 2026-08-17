@@ -64,12 +64,17 @@ family does it differently:
   docs.
 - **`nemotron-nano-9b*`** — a `/think` or `/no_think` suffix appended to
   the system prompt. Also confirmed in NVIDIA's own docs.
-- **`nemotron-omni-30b-thinking`** and **`deepseek-v4-flash*`** — a
-  `chat_template_kwargs` parameter in the request body. **Caveat:** NVIDIA
-  doesn't document these two model-specific parameters directly — this is
-  sourced from community tooling, not official docs. If either starts
-  erroring, check `GET /v1/models` on your proxy and NVIDIA's own model
-  page at build.nvidia.com for that model.
+- **`nemotron-omni-30b-thinking`, `deepseek-v4-flash*`, `glm-5.2*`** — a
+  `chat_template_kwargs` / `reasoning_effort` parameter in the request
+  body. **Caveat:** NVIDIA doesn't document these model-specific
+  parameters directly — sourced from community tooling and vendor docs
+  outside NVIDIA's own site. GLM-5.2 in particular was initially
+  configured to rely on an assumed "thinking on by default," which turned
+  out not to hold on NVIDIA's actual hosted endpoint — it now explicitly
+  forces the reasoning parameter instead. If a model in this group stops
+  showing a `<think>` block, check `GET /v1/models` on your proxy and the
+  model's own page at build.nvidia.com — the exact parameter name may
+  have changed.
 
 The proxy picks the right mechanism automatically based on which
 `model_name` you send — you don't need to know any of this to use it,

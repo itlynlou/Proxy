@@ -88,21 +88,29 @@ const MODEL_CONFIGS = {
     kwargsOn: { chat_template_kwargs: { thinking: true } },
   },
 
-  // Confirmed real and free on NIM (build.nvidia.com/z-ai/glm-5.2). Per
-  // its own vLLM docs, thinking is ON BY DEFAULT — no extra parameter
-  // needed, so this is a plain passthrough. reasoning_effort can be set
-  // to "high" (faster, less thorough) instead of the default "max".
+  // Confirmed real and free on NIM (build.nvidia.com/z-ai/glm-5.2). Its
+  // own vLLM docs claim thinking is on by default, but that did NOT hold
+  // on NVIDIA's actual hosted endpoint — sending no extra params produced
+  // no reasoning trace at all. Fix: explicitly force reasoning_effort via
+  // BOTH documented paths (top-level field AND chat_template_kwargs),
+  // since it's unclear which one NIM's specific deployment honors.
   "glm-5.2": {
     id: "z-ai/glm-5.2",
     mode: "kwargs",
     forceThinking: true,
-    kwargsOn: {},
+    kwargsOn: {
+      reasoning_effort: "max",
+      chat_template_kwargs: { reasoning_effort: "max", enable_thinking: true, thinking: true },
+    },
   },
   "glm-5.2-fast": {
     id: "z-ai/glm-5.2",
     mode: "kwargs",
     forceThinking: true,
-    kwargsOn: { chat_template_kwargs: { reasoning_effort: "high" } },
+    kwargsOn: {
+      reasoning_effort: "high",
+      chat_template_kwargs: { reasoning_effort: "high", enable_thinking: true, thinking: true },
+    },
   },
 };
 
@@ -155,16 +163,24 @@ function buildNimBody(config, body) {
   return out;
 }
 
-// Merges NIM's separate reasoning_content into the visible message so
+// Merges NIM's separate reasoning field into the visible message so
 // Janitor AI (which just renders `content`) actually shows the thinking
 // trace, wrapped in <think> tags — the same convention DeepSeek-R1-style
 // UIs use, so it reads naturally as "the model thinking out loud."
+// Different model families on NIM don't all use the same field name for
+// this, so we check the common variants rather than just one.
+function extractReasoning(obj) {
+  return obj?.reasoning_content || obj?.reasoning || obj?.thinking || null;
+}
+
 function mergeReasoningNonStreaming(data) {
-  const choice = data?.choices?.[0];
-  const msg = choice?.message;
-  if (msg?.reasoning_content) {
-    msg.content = `<think>\n${msg.reasoning_content}\n</think>\n\n${msg.content || ""}`;
+  const msg = data?.choices?.[0]?.message;
+  const reasoning = extractReasoning(msg);
+  if (reasoning) {
+    msg.content = `<think>\n${reasoning}\n</think>\n\n${msg.content || ""}`;
     delete msg.reasoning_content;
+    delete msg.reasoning;
+    delete msg.thinking;
   }
   return data;
 }
@@ -279,14 +295,17 @@ app.post("/v1/chat/completions", async (req, res) => {
 
         const delta = chunk.choices?.[0]?.delta;
         if (delta) {
-          if (delta.reasoning_content) {
-            let text = delta.reasoning_content;
+          const reasoningPiece = delta.reasoning_content || delta.reasoning || delta.thinking;
+          if (reasoningPiece) {
+            let text = reasoningPiece;
             if (!sentOpenTag) {
               text = "<think>\n" + text;
               sentOpenTag = true;
             }
             delta.content = text;
             delete delta.reasoning_content;
+            delete delta.reasoning;
+            delete delta.thinking;
           } else if (delta.content && sentOpenTag && !sentCloseTag) {
             delta.content = "\n</think>\n\n" + delta.content;
             sentCloseTag = true;
