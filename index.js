@@ -88,29 +88,27 @@ const MODEL_CONFIGS = {
     kwargsOn: { chat_template_kwargs: { thinking: true } },
   },
 
-  // Confirmed real and free on NIM (build.nvidia.com/z-ai/glm-5.2). Its
-  // own vLLM docs claim thinking is on by default, but that did NOT hold
-  // on NVIDIA's actual hosted endpoint — sending no extra params produced
-  // no reasoning trace at all. Fix: explicitly force reasoning_effort via
-  // BOTH documented paths (top-level field AND chat_template_kwargs),
-  // since it's unclear which one NIM's specific deployment honors.
-  "glm-5.2": {
-    id: "z-ai/glm-5.2",
+  // GLM-5.2 is deprecated on NIM as of this update — replaced with
+  // DeepSeek V4 Flash 0731. Unlike GLM-5.2, this parameter shape is taken
+  // directly from NVIDIA's own official sample code at
+  // build.nvidia.com/deepseek-ai/deepseek-v4-flash-0731, not guessed —
+  // their sample explicitly checks for reasoning under either
+  // `.reasoning` or `.reasoning_content`, confirming the broadened
+  // field-detection in mergeReasoningNonStreaming/streaming below.
+  // Caveat (unrelated to config correctness): several NVIDIA developer
+  // forum threads report this specific model hallucinating more than the
+  // model it replaced — worth knowing, not something a proxy can fix.
+  "deepseek-v4-flash-0731": {
+    id: "deepseek-ai/deepseek-v4-flash-0731",
     mode: "kwargs",
-    forceThinking: true,
-    kwargsOn: {
-      reasoning_effort: "max",
-      chat_template_kwargs: { reasoning_effort: "max", enable_thinking: true, thinking: true },
-    },
+    kwargsOn: { chat_template_kwargs: { thinking: true, reasoning_effort: "high" } },
+    kwargsOff: { chat_template_kwargs: { thinking: false } },
   },
-  "glm-5.2-fast": {
-    id: "z-ai/glm-5.2",
+  "deepseek-v4-flash-0731-thinking": {
+    id: "deepseek-ai/deepseek-v4-flash-0731",
     mode: "kwargs",
     forceThinking: true,
-    kwargsOn: {
-      reasoning_effort: "high",
-      chat_template_kwargs: { reasoning_effort: "high", enable_thinking: true, thinking: true },
-    },
+    kwargsOn: { chat_template_kwargs: { thinking: true, reasoning_effort: "high" } },
   },
 };
 
@@ -224,6 +222,30 @@ app.get("/v1/models", async (req, res) => {
   }
 });
 
+// NVIDIA NIM's free tier is rate-limited per-minute (not just a daily
+// cap), so a burst of messages in an active chat can trip a 429 that
+// clears within seconds. Rather than failing the message outright, retry
+// a couple of times with backoff — honoring NIM's Retry-After header if
+// it sends one, otherwise a short fixed delay.
+async function fetchWithRetry(url, options, maxRetries = 2) {
+  let lastResponse;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const response = await fetch(url, options);
+    if (response.status !== 429) return response;
+
+    lastResponse = response;
+    if (attempt === maxRetries) break; // out of retries, return the 429 as-is
+
+    const retryAfterHeader = response.headers.get("retry-after");
+    const retryAfterMs = retryAfterHeader ? Number(retryAfterHeader) * 1000 : null;
+    const delayMs = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : 1000 * (attempt + 1);
+
+    console.warn(`[nim rate-limited] attempt ${attempt + 1}/${maxRetries + 1}, retrying in ${delayMs}ms`);
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return lastResponse;
+}
+
 app.post("/v1/chat/completions", async (req, res) => {
   if (!NIM_KEY) {
     return res.status(500).json({ error: { message: "Proxy misconfigured: NVIDIA_API_KEY env var is not set." } });
@@ -235,7 +257,7 @@ app.post("/v1/chat/completions", async (req, res) => {
   const streaming = !!nimBody.stream;
 
   try {
-    const upstream = await fetch(`${NIM_BASE}/chat/completions`, {
+    const upstream = await fetchWithRetry(`${NIM_BASE}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${NIM_KEY}` },
       body: JSON.stringify(nimBody),

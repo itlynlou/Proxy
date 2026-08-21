@@ -38,8 +38,8 @@ Open your `.vercel.app` URL in a browser — you should see
 | `nemotron-omni-30b-thinking` | always on (reasoning-only checkpoint) | no non-thinking variant exists |
 | `deepseek-v4-flash-thinking` | always on | best-effort — see caveat below |
 | `deepseek-v4-flash` | off | best-effort — see caveat below |
-| `glm-5.2` | always on (default behavior) | 753B MoE, 1M context, thinks by default — no special config needed |
-| `glm-5.2-fast` | on, lower effort | same model, `reasoning_effort: "high"` instead of default `"max"` — faster, less thorough |
+| `deepseek-v4-flash-0731-thinking` | always on | newer checkpoint; request shape confirmed against NVIDIA's own official sample code |
+| `deepseek-v4-flash-0731` | off | see hallucination caveat below |
 
 **Any other NVIDIA NIM model works too** — just send its real model id (the
 kind with a `/` in it, e.g. `qwen/qwen3-235b-a22b`,
@@ -64,17 +64,18 @@ family does it differently:
   docs.
 - **`nemotron-nano-9b*`** — a `/think` or `/no_think` suffix appended to
   the system prompt. Also confirmed in NVIDIA's own docs.
-- **`nemotron-omni-30b-thinking`, `deepseek-v4-flash*`, `glm-5.2*`** — a
-  `chat_template_kwargs` / `reasoning_effort` parameter in the request
-  body. **Caveat:** NVIDIA doesn't document these model-specific
-  parameters directly — sourced from community tooling and vendor docs
-  outside NVIDIA's own site. GLM-5.2 in particular was initially
-  configured to rely on an assumed "thinking on by default," which turned
-  out not to hold on NVIDIA's actual hosted endpoint — it now explicitly
-  forces the reasoning parameter instead. If a model in this group stops
-  showing a `<think>` block, check `GET /v1/models` on your proxy and the
-  model's own page at build.nvidia.com — the exact parameter name may
-  have changed.
+- **`nemotron-omni-30b-thinking`, `deepseek-v4-flash*`,
+  `deepseek-v4-flash-0731*`** — a `chat_template_kwargs` /
+  `reasoning_effort` parameter in the request body. The `-0731` variant's
+  request shape is confirmed directly from NVIDIA's own official sample
+  code at build.nvidia.com/deepseek-ai/deepseek-v4-flash-0731 — the other
+  two are community-sourced and best-effort. **Caveat for
+  `deepseek-v4-flash-0731` specifically:** several recent NVIDIA developer
+  forum threads report this checkpoint hallucinating more than the model
+  it replaced — worth knowing going in, not something a proxy can fix.
+  If a model in this group stops showing a `<think>` block, check
+  `GET /v1/models` on your proxy and the model's own page at
+  build.nvidia.com — the exact parameter name may have changed.
 
 The proxy picks the right mechanism automatically based on which
 `model_name` you send — you don't need to know any of this to use it,
@@ -123,5 +124,11 @@ by the reasoning, then `</think>` and the actual answer.
   models can change without much notice. `GET /v1/models` on your proxy
   always reflects the current `MODEL_CONFIGS` in `api/index.js`; NVIDIA's
   own catalog is at https://build.nvidia.com.
+- **429 "Too Many Requests"** means you've hit NVIDIA's real per-minute
+  rate limit — this proxy automatically retries a request up to twice
+  (honoring NVIDIA's `Retry-After` header when it sends one) before
+  giving up, so brief bursts usually resolve on their own. If you still
+  see a 429 after that, you're sending faster than the limit allows —
+  wait a bit before the next message.
 - This proxy adds no rate limiting or auth of its own beyond what NVIDIA
   enforces — anyone who finds your `.vercel.app` URL can use your quota.
