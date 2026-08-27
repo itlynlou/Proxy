@@ -110,6 +110,30 @@ const MODEL_CONFIGS = {
     forceThinking: true,
     kwargsOn: { chat_template_kwargs: { thinking: true, reasoning_effort: "high" } },
   },
+
+  // DeepSeek-V4-Pro-0813 — confirmed real on NIM directly against
+  // NVIDIA's own API reference (docs.api.nvidia.com/nim/reference/
+  // deepseek-ai-deepseek-v4-pro-0813). The larger sibling of Flash-0731:
+  // 1.6T total / 49B active params, native 1M-token context window (no
+  // special parameter needed for that — it's just the model's built-in
+  // limit, same as any other model's context size). Three reasoning
+  // levels: Non-think, Think High, Think Max. Per its own vLLM recipe
+  // some sources claim "thinking on by default" — after GLM-5.2's default
+  // claim turning out false on NIM's actual endpoint, this explicitly
+  // forces reasoning_effort: "max" (the highest/most thorough level)
+  // rather than trusting that again.
+  "deepseek-v4-pro-0813-thinking": {
+    id: "deepseek-ai/deepseek-v4-pro-0813",
+    mode: "kwargs",
+    forceThinking: true,
+    kwargsOn: { chat_template_kwargs: { thinking: true, reasoning_effort: "max" } },
+  },
+  "deepseek-v4-pro-0813": {
+    id: "deepseek-ai/deepseek-v4-pro-0813",
+    mode: "kwargs",
+    kwargsOn: { chat_template_kwargs: { thinking: true, reasoning_effort: "max" } },
+    kwargsOff: { chat_template_kwargs: { thinking: false } },
+  },
 };
 
 const DEFAULT_MODEL = "nemotron-49b-thinking";

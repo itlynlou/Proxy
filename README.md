@@ -40,6 +40,8 @@ Open your `.vercel.app` URL in a browser — you should see
 | `deepseek-v4-flash` | off | best-effort — see caveat below |
 | `deepseek-v4-flash-0731-thinking` | always on | newer checkpoint; request shape confirmed against NVIDIA's own official sample code |
 | `deepseek-v4-flash-0731` | off | see hallucination caveat below |
+| `deepseek-v4-pro-0813-thinking` | always on (`reasoning_effort: max`) | 1.6T/49B active, native 1M-token context, NVIDIA-confirmed real |
+| `deepseek-v4-pro-0813` | off | same model, faster/cheaper without reasoning |
 
 **Any other NVIDIA NIM model works too** — just send its real model id (the
 kind with a `/` in it, e.g. `qwen/qwen3-235b-a22b`,
@@ -65,14 +67,20 @@ family does it differently:
 - **`nemotron-nano-9b*`** — a `/think` or `/no_think` suffix appended to
   the system prompt. Also confirmed in NVIDIA's own docs.
 - **`nemotron-omni-30b-thinking`, `deepseek-v4-flash*`,
-  `deepseek-v4-flash-0731*`** — a `chat_template_kwargs` /
-  `reasoning_effort` parameter in the request body. The `-0731` variant's
-  request shape is confirmed directly from NVIDIA's own official sample
-  code at build.nvidia.com/deepseek-ai/deepseek-v4-flash-0731 — the other
-  two are community-sourced and best-effort. **Caveat for
+  `deepseek-v4-flash-0731*`, `deepseek-v4-pro-0813*`** — a
+  `chat_template_kwargs` / `reasoning_effort` parameter in the request
+  body. The `-0731` variant's request shape is confirmed directly from
+  NVIDIA's own official sample code at
+  build.nvidia.com/deepseek-ai/deepseek-v4-flash-0731; `-0813` uses the
+  same confirmed shape scaled up. The other two (`deepseek-v4-flash`,
+  `nemotron-omni-30b`) are community-sourced and best-effort. **Caveat for
   `deepseek-v4-flash-0731` specifically:** several recent NVIDIA developer
   forum threads report this checkpoint hallucinating more than the model
   it replaced — worth knowing going in, not something a proxy can fix.
+  **Note on `-0813`:** some third-party sources claim it thinks by default
+  with no extra parameters — that exact claim about GLM-5.2 turned out to
+  be false on NVIDIA's actual endpoint, so `deepseek-v4-pro-0813-thinking`
+  explicitly forces `reasoning_effort: "max"` rather than trusting it.
   If a model in this group stops showing a `<think>` block, check
   `GET /v1/models` on your proxy and the model's own page at
   build.nvidia.com — the exact parameter name may have changed.
