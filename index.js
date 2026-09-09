@@ -117,12 +117,23 @@ const MODEL_CONFIGS = {
   // 1.6T total / 49B active params, native 1M-token context window (no
   // special parameter needed for that — it's just the model's built-in
   // limit, same as any other model's context size). Three reasoning
-  // levels: Non-think, Think High, Think Max. Per its own vLLM recipe
-  // some sources claim "thinking on by default" — after GLM-5.2's default
-  // claim turning out false on NIM's actual endpoint, this explicitly
-  // forces reasoning_effort: "max" (the highest/most thorough level)
-  // rather than trusting that again.
+  // levels: Non-think, Think High, Think Max.
+  //
+  // Set to "max" (most thorough) by request. Known tradeoff: "max" on
+  // this 1.6T model previously exceeded Vercel's 60s function timeout in
+  // practice, surfacing to Janitor AI as a generic "Failed to fetch" with
+  // no error body (Vercel kills the function before any response is
+  // sent). If that recurs, either switch this back to "high" or use
+  // deepseek-v4-pro-0813 (thinking off) instead.
   "deepseek-v4-pro-0813-thinking": {
+    id: "deepseek-ai/deepseek-v4-pro-0813",
+    mode: "kwargs",
+    forceThinking: true,
+    kwargsOn: { chat_template_kwargs: { thinking: true, reasoning_effort: "max" } },
+  },
+  // Identical to the default above now that it's also "max" — kept as an
+  // explicit alias in case the default gets switched back to "high" later.
+  "deepseek-v4-pro-0813-max": {
     id: "deepseek-ai/deepseek-v4-pro-0813",
     mode: "kwargs",
     forceThinking: true,
@@ -133,6 +144,47 @@ const MODEL_CONFIGS = {
     mode: "kwargs",
     kwargsOn: { chat_template_kwargs: { thinking: true, reasoning_effort: "max" } },
     kwargsOff: { chat_template_kwargs: { thinking: false } },
+  },
+
+  // Kimi K3 (Moonshot AI) — confirmed real and free on NIM directly
+  // against NVIDIA's own API reference (docs.api.nvidia.com/nim/reference/
+  // moonshotai-kimi-k3) and Kimi's own docs. 2.8T total / 104B active
+  // params, native 1M-token context. Unlike the DeepSeek/GLM models
+  // above, thinking CANNOT be turned off — it's a thinking-only model —
+  // but reasoning depth is tunable via a top-level reasoning_effort field
+  // ("low"/"high"/"max", officially defaults to "max").
+  //
+  // Default here is "high", not "max" — Kimi's own docs note "max" on a
+  // model this size can take roughly a minute per response even on
+  // dedicated GPU clusters, which risks the exact Vercel-timeout failure
+  // mode DeepSeek-V4-Pro-0813 hit earlier. "low" is also offered for
+  // quick/simple messages where deep reasoning isn't needed.
+  //
+  // Known limitation, not fixable at the proxy level: Kimi K3 expects its
+  // own prior reasoning_content echoed back on every turn for best
+  // multi-turn quality. Janitor AI's client only stores/sends back plain
+  // `content`, with no concept of `reasoning_content` — so multi-turn
+  // conversations through Janitor AI will not get this optimization, and
+  // reasoning quality may drift over a long roleplay session. This is a
+  // limitation of Janitor AI's client shape, not something this proxy
+  // can transparently work around.
+  "kimi-k3-thinking": {
+    id: "moonshotai/kimi-k3",
+    mode: "kwargs",
+    forceThinking: true,
+    kwargsOn: { reasoning_effort: "high" },
+  },
+  "kimi-k3-max": {
+    id: "moonshotai/kimi-k3",
+    mode: "kwargs",
+    forceThinking: true,
+    kwargsOn: { reasoning_effort: "max" },
+  },
+  "kimi-k3-fast": {
+    id: "moonshotai/kimi-k3",
+    mode: "kwargs",
+    forceThinking: true,
+    kwargsOn: { reasoning_effort: "low" },
   },
 };
 

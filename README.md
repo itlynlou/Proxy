@@ -40,8 +40,12 @@ Open your `.vercel.app` URL in a browser — you should see
 | `deepseek-v4-flash` | off | best-effort — see caveat below |
 | `deepseek-v4-flash-0731-thinking` | always on | newer checkpoint; request shape confirmed against NVIDIA's own official sample code |
 | `deepseek-v4-flash-0731` | off | see hallucination caveat below |
-| `deepseek-v4-pro-0813-thinking` | always on (`reasoning_effort: max`) | 1.6T/49B active, native 1M-token context, NVIDIA-confirmed real |
+| `deepseek-v4-pro-0813-thinking` | always on (`reasoning_effort: max`) | 1.6T/49B active, native 1M-token context — **may exceed Vercel Hobby's 60s timeout**, see caveat below |
+| `deepseek-v4-pro-0813-max` | same as above | identical alias, kept in case the default changes back to `high` later |
 | `deepseek-v4-pro-0813` | off | same model, faster/cheaper without reasoning |
+| `kimi-k3-thinking` | always on, `reasoning_effort: high` (can't be disabled) | 2.8T/104B active, 1M context — see multi-turn caveat below |
+| `kimi-k3-max` | always on, `reasoning_effort: max` | most thorough, risks the same Vercel timeout DeepSeek-Pro-max hit |
+| `kimi-k3-fast` | always on, `reasoning_effort: low` | quickest option for simple messages |
 
 **Any other NVIDIA NIM model works too** — just send its real model id (the
 kind with a `/` in it, e.g. `qwen/qwen3-235b-a22b`,
@@ -80,7 +84,15 @@ family does it differently:
   **Note on `-0813`:** some third-party sources claim it thinks by default
   with no extra parameters — that exact claim about GLM-5.2 turned out to
   be false on NVIDIA's actual endpoint, so `deepseek-v4-pro-0813-thinking`
-  explicitly forces `reasoning_effort: "max"` rather than trusting it.
+  explicitly forces `reasoning_effort` rather than trusting it. Currently
+  set to `"max"` (most thorough) — this previously caused this exact
+  model to exceed Vercel's 60-second function timeout in practice, which
+  showed up in Janitor AI as a generic `"Failed to fetch"` with no error
+  body at all (Vercel kills the function before any response gets sent,
+  so there's nothing for this proxy's own error handling to catch or
+  log). If that happens again, switch to `reasoning_effort: "high"` in
+  `api/index.js` (meaningfully faster, still strong per DeepSeek's own
+  benchmarks) or use `deepseek-v4-pro-0813` (thinking off).
   If a model in this group stops showing a `<think>` block, check
   `GET /v1/models` on your proxy and the model's own page at
   build.nvidia.com — the exact parameter name may have changed.
@@ -101,8 +113,23 @@ and non-streamed responses.
 
 If you'd rather not see the reasoning trace inline in Janitor AI, use the
 non-thinking variant of a model (e.g. `nemotron-49b` instead of
-`nemotron-49b-thinking`) — the omni-30b model is reasoning-only, so
-there's no way to turn it off for that one specifically.
+`nemotron-49b-thinking`) — the omni-30b and Kimi K3 models are
+reasoning-only, so there's no way to turn thinking off for those.
+
+## Kimi K3's multi-turn limitation (can't be fixed at the proxy level)
+
+Kimi K3 is designed to receive its own previous `reasoning_content` back
+on every turn of a conversation — without it, Moonshot's own docs note
+reasoning quality degrades over a multi-turn session. Janitor AI's client
+only ever sends and stores plain `content`; it has no concept of
+`reasoning_content` at all, so it can't echo something it never receives
+in a form it recognizes. This proxy strips reasoning into a visible
+`<think>` block specifically so *you* can see it, but that's a display
+choice — it doesn't reconstruct the original structured field Kimi wants
+back. Practically: expect Kimi K3's reasoning quality in Janitor AI to
+hold up fine for shorter exchanges, but potentially drift on very long
+roleplay sessions. This is a limitation of what Janitor AI's client
+sends, not something fixable by changing this proxy's code.
 
 ## Quick manual test
 
