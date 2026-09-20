@@ -1,7 +1,7 @@
 {
-  "rewrites": [{ "source": "/(.*)", "destination": "/api" }],
+  "rewrites": [{ "source": "/(.*)", "destination": "/api/handler" }],
   "functions": {
-    "api/index.js": {
+    "api/handler.js": {
       "maxDuration": 60
     }
   }

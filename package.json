@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "description": "OpenAI-compatible proxy for Janitor AI using NVIDIA NIM's free models, with normalized thinking-mode support.",
   "type": "module",
-  "main": "api/index.js",
+  "main": "api/handler.js",
   "scripts": {
-    "start": "node api/index.js"
+    "start": "node api/handler.js"
   },
   "engines": {
     "node": ">=18"

@@ -46,6 +46,9 @@ Open your `.vercel.app` URL in a browser — you should see
 | `kimi-k3-thinking` | always on, `reasoning_effort: high` (can't be disabled) | 2.8T/104B active, 1M context — see multi-turn caveat below |
 | `kimi-k3-max` | always on, `reasoning_effort: max` | most thorough, risks the same Vercel timeout DeepSeek-Pro-max hit |
 | `kimi-k3-fast` | always on, `reasoning_effort: low` | quickest option for simple messages |
+| `glm-5.3-thinking` | always on (can't be disabled), `reasoning_effort: high` | 753B/40B active, 1M context |
+| `glm-5.3-max` | always on, `reasoning_effort: max` | most thorough, risks the same Vercel timeout DeepSeek-Pro-max hit |
+| `glm-5.3-fast` | always on, `reasoning_effort: low` | quickest option |
 
 **Any other NVIDIA NIM model works too** — just send its real model id (the
 kind with a `/` in it, e.g. `qwen/qwen3-235b-a22b`,
@@ -91,7 +94,7 @@ family does it differently:
   body at all (Vercel kills the function before any response gets sent,
   so there's nothing for this proxy's own error handling to catch or
   log). If that happens again, switch to `reasoning_effort: "high"` in
-  `api/index.js` (meaningfully faster, still strong per DeepSeek's own
+  `api/handler.js` (meaningfully faster, still strong per DeepSeek's own
   benchmarks) or use `deepseek-v4-pro-0813` (thinking off).
   If a model in this group stops showing a `<think>` block, check
   `GET /v1/models` on your proxy and the model's own page at
@@ -152,12 +155,21 @@ by the reasoning, then `</think>` and the actual answer.
 - **Check Vercel's Deployments tab** for a red ✗ and its build/runtime log.
 - **Confirm `NVIDIA_API_KEY`** is set for the Production environment in
   Vercel's project settings, and redeploy after any change to it.
+- **"Cannot POST /api" or similar** — this project's routing config went
+  through a few iterations before landing on the current one (a named
+  `api/handler.js` function plus a `vercel.json` rewrite pointing at it,
+  rather than the special-cased `api/index.js`). If you still see this
+  after deploying the current files, that's a genuine open question, not
+  a known/expected failure mode — test directly with
+  `curl -i https://your-project.vercel.app/v1/models` and share the exact
+  output (status code and body) rather than just the error message, since
+  that's what actually narrows down the cause.
 
 ## Notes
 
 - NVIDIA's free tier is a "preview" offering — rate limits and available
   models can change without much notice. `GET /v1/models` on your proxy
-  always reflects the current `MODEL_CONFIGS` in `api/index.js`; NVIDIA's
+  always reflects the current `MODEL_CONFIGS` in `api/handler.js`; NVIDIA's
   own catalog is at https://build.nvidia.com.
 - **429 "Too Many Requests"** means you've hit NVIDIA's real per-minute
   rate limit — this proxy automatically retries a request up to twice
