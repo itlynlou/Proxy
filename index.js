@@ -1,6 +1,30 @@
 import express from "express";
+import { parse as parseUrl } from "node:url";
 
 const app = express();
+
+// The vercel.json rewrite forwards every request to this single function
+// as "/api?path=<real-path>", passing the actual requested path through
+// as a query parameter rather than relying on Vercel to preserve it in
+// req.url directly (that assumption produced a reliable "Cannot POST
+// /api" error in practice — see vercel.json's comment for why).
+// Reconstruct the real req.url from that query param here, before
+// anything else runs, so every route below can stay defined exactly as
+// Janitor AI would request it (e.g. "/v1/chat/completions"). Any other
+// original query params (e.g. our own "?all=1" on /v1/models) are
+// preserved alongside the reconstructed path.
+app.use((req, res, next) => {
+  const parsed = parseUrl(req.url, true);
+  if (typeof parsed.query.path === "string") {
+    const { path, ...rest } = parsed.query;
+    const search = new URLSearchParams(rest).toString();
+    req.url = "/" + path + (search ? `?${search}` : "");
+  }
+  // If "path" isn't present (e.g. local dev via `node api/index.js`,
+  // where no Vercel rewrite is involved), leave req.url untouched.
+  next();
+});
+
 app.use(express.json({ limit: "25mb" }));
 
 app.use((req, res, next) => {
@@ -186,6 +210,58 @@ const MODEL_CONFIGS = {
     forceThinking: true,
     kwargsOn: { reasoning_effort: "low" },
   },
+
+  // GLM-5.3 (Z.ai) — confirmed real and free on NIM directly against
+  // NVIDIA's own API reference (docs.api.nvidia.com/nim/reference/
+  // z-ai-glm-5-3) and Z.ai's own docs. 753B-parameter MoE, 1M-token
+  // context. Like Kimi K3, thinking CANNOT be disabled — Z.ai's own
+  // migration notes call this a breaking change from GLM-5.2, which did
+  // allow disabling it. Three reasoning_effort levels: low, high, max
+  // (default max per Z.ai's docs).
+  //
+  // After GLM-5.2's "thinking on by default" claim turning out false on
+  // NIM's actual endpoint, this sends MULTIPLE redundant parameter
+  // conventions at once rather than trusting any single documented shape:
+  // Z.ai's own native format (top-level `thinking: {type: "enabled"}` +
+  // top-level `reasoning_effort`) AND the chat_template_kwargs shape NIM
+  // uses for DeepSeek, in case NIM's hosted deployment expects that
+  // instead.
+  //
+  // Default is "high", not "max" — this is another ~750B-class model,
+  // and "max" reasoning effort on DeepSeek-V4-Pro-0813 (a similar size)
+  // already reliably blew past Vercel's 60s timeout once. Not repeating
+  // that by default here; "max" is still available as an explicit
+  // opt-in below.
+  "glm-5.3-thinking": {
+    id: "z-ai/glm-5.3",
+    mode: "kwargs",
+    forceThinking: true,
+    kwargsOn: {
+      thinking: { type: "enabled" },
+      reasoning_effort: "high",
+      chat_template_kwargs: { thinking: true, enable_thinking: true, reasoning_effort: "high" },
+    },
+  },
+  "glm-5.3-max": {
+    id: "z-ai/glm-5.3",
+    mode: "kwargs",
+    forceThinking: true,
+    kwargsOn: {
+      thinking: { type: "enabled" },
+      reasoning_effort: "max",
+      chat_template_kwargs: { thinking: true, enable_thinking: true, reasoning_effort: "max" },
+    },
+  },
+  "glm-5.3-fast": {
+    id: "z-ai/glm-5.3",
+    mode: "kwargs",
+    forceThinking: true,
+    kwargsOn: {
+      thinking: { type: "enabled" },
+      reasoning_effort: "low",
+      chat_template_kwargs: { thinking: true, enable_thinking: true, reasoning_effort: "low" },
+    },
+  },
 };
 
 const DEFAULT_MODEL = "nemotron-49b-thinking";
@@ -208,8 +284,16 @@ function resolveModel(requested) {
 // Builds the actual outbound NIM request body: sets the real model id and
 // applies whichever thinking-toggle mechanism that model uses.
 function buildNimBody(config, body) {
-  const out = { ...body, model: config.id };
-  const wantThinking = config.forceThinking || body.thinking !== false;
+  // Our own on/off control flag is read from the caller's body as
+  // "thinking", but that field name collides with some models' own real
+  // API parameter of the same name (GLM-5.3 requires a top-level
+  // `thinking: {type: "enabled"}` object). Strip our internal flag from
+  // the incoming body BEFORE constructing the outbound request, so a
+  // model's own legitimate "thinking" field (set via kwargsOn below)
+  // never gets clobbered by cleanup logic afterward.
+  const { thinking: internalThinkingFlag, ...bodyWithoutOurFlag } = body;
+  const out = { ...bodyWithoutOurFlag, model: config.id };
+  const wantThinking = config.forceThinking || internalThinkingFlag !== false;
 
   if (config.mode === "system_prompt") {
     const text = wantThinking ? config.on : config.off;
@@ -233,7 +317,6 @@ function buildNimBody(config, body) {
     Object.assign(out, wantThinking ? config.kwargsOn : config.kwargsOff || {});
   }
 
-  delete out.thinking; // our own flag, not a real NIM/OpenAI param
   return out;
 }
 

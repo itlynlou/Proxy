@@ -23,6 +23,20 @@ credit card required). Rate-limited but with no daily cap as of writing.
 Open your `.vercel.app` URL in a browser — you should see
 `{"status":"ok",...}` with a `models` array.
 
+**How routing works here, and why:** all requests get forwarded to this
+single function as `/api?path=<real-path>` (see `vercel.json`), and the
+function reconstructs the real path from that query parameter itself
+before Express does any route matching. This is a deliberate choice —
+an earlier version relied on Vercel preserving the original path
+automatically when rewriting to a fixed destination, which reliably
+produced a `Cannot POST /api` error in practice (Express receiving
+literally `/api` as the path, no matter what was actually requested).
+Passing the path through as a query parameter sidesteps that ambiguity
+entirely, since query strings are unambiguously preserved by any
+rewrite. If you ever see `Cannot POST /api` again after this fix, the
+`?path=` parameter itself likely isn't reaching the function — check
+`vercel.json`'s rewrite is deployed correctly.
+
 ## Configure Janitor AI
 
 - **Endpoint:** `https://your-project-name.vercel.app/v1`
@@ -46,6 +60,9 @@ Open your `.vercel.app` URL in a browser — you should see
 | `kimi-k3-thinking` | always on, `reasoning_effort: high` (can't be disabled) | 2.8T/104B active, 1M context — see multi-turn caveat below |
 | `kimi-k3-max` | always on, `reasoning_effort: max` | most thorough, risks the same Vercel timeout DeepSeek-Pro-max hit |
 | `kimi-k3-fast` | always on, `reasoning_effort: low` | quickest option for simple messages |
+| `glm-5.3-thinking` | always on, `reasoning_effort: high` (can't be disabled) | 753B MoE, 1M context |
+| `glm-5.3-max` | always on, `reasoning_effort: max` | most thorough — may hit the same Vercel timeout risk as DeepSeek-Pro-max |
+| `glm-5.3-fast` | always on, `reasoning_effort: low` | quickest option |
 | `glm-5.3-thinking` | always on (can't be disabled), `reasoning_effort: high` | 753B/40B active, 1M context |
 | `glm-5.3-max` | always on, `reasoning_effort: max` | most thorough, risks the same Vercel timeout DeepSeek-Pro-max hit |
 | `glm-5.3-fast` | always on, `reasoning_effort: low` | quickest option |
@@ -94,11 +111,28 @@ family does it differently:
   body at all (Vercel kills the function before any response gets sent,
   so there's nothing for this proxy's own error handling to catch or
   log). If that happens again, switch to `reasoning_effort: "high"` in
-  `api/handler.js` (meaningfully faster, still strong per DeepSeek's own
+  `api/index.js` (meaningfully faster, still strong per DeepSeek's own
   benchmarks) or use `deepseek-v4-pro-0813` (thinking off).
   If a model in this group stops showing a `<think>` block, check
   `GET /v1/models` on your proxy and the model's own page at
   build.nvidia.com — the exact parameter name may have changed.
+- **`glm-5.3*`** — Z.ai's own format uses a top-level `thinking:
+  {type: "enabled"}` object plus a top-level `reasoning_effort` field,
+  different again from DeepSeek's `chat_template_kwargs` shape. This
+  proxy sends both conventions at once (redundant, but robust to which
+  one NIM's specific deployment actually honors) rather than betting on
+  just one — the same lesson from GLM-5.2's default assumption failing
+  applies here too. Thinking can't be disabled on this model at all
+  (Z.ai's own migration notes call this a breaking change from GLM-5.2).
+  **A bug this surfaced and fixed:** GLM-5.3's required `thinking` field
+  has the same name as this proxy's own internal on/off control flag —
+  an earlier version of the code unconditionally deleted any `thinking`
+  key before sending the request (meant to strip the internal flag),
+  which silently wiped out GLM-5.3's actual required parameter instead.
+  Fixed by stripping the internal flag from the incoming request first,
+  before any model-specific parameters get added — a model's own
+  legitimately-named field can no longer collide with proxy-internal
+  bookkeeping.
 
 The proxy picks the right mechanism automatically based on which
 `model_name` you send — you don't need to know any of this to use it,
@@ -157,7 +191,7 @@ by the reasoning, then `</think>` and the actual answer.
   Vercel's project settings, and redeploy after any change to it.
 - **"Cannot POST /api" or similar** — this project's routing config went
   through a few iterations before landing on the current one (a named
-  `api/handler.js` function plus a `vercel.json` rewrite pointing at it,
+  `api/index.js` function plus a `vercel.json` rewrite pointing at it,
   rather than the special-cased `api/index.js`). If you still see this
   after deploying the current files, that's a genuine open question, not
   a known/expected failure mode — test directly with
@@ -169,7 +203,7 @@ by the reasoning, then `</think>` and the actual answer.
 
 - NVIDIA's free tier is a "preview" offering — rate limits and available
   models can change without much notice. `GET /v1/models` on your proxy
-  always reflects the current `MODEL_CONFIGS` in `api/handler.js`; NVIDIA's
+  always reflects the current `MODEL_CONFIGS` in `api/index.js`; NVIDIA's
   own catalog is at https://build.nvidia.com.
 - **429 "Too Many Requests"** means you've hit NVIDIA's real per-minute
   rate limit — this proxy automatically retries a request up to twice
