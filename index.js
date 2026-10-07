@@ -98,76 +98,73 @@ const MODEL_CONFIGS = {
     kwargsOn: { chat_template_kwargs: { enable_thinking: true }, reasoning_budget: 16384 },
   },
 
-  // Community-sourced (chat_template_kwargs) — flag as best-effort.
-  "deepseek-v4-flash": {
-    id: "deepseek-ai/deepseek-v4-flash",
-    mode: "kwargs",
-    kwargsOn: { chat_template_kwargs: { thinking: true } },
-    kwargsOff: { chat_template_kwargs: { thinking: false } },
-  },
-  "deepseek-v4-flash-thinking": {
-    id: "deepseek-ai/deepseek-v4-flash",
-    mode: "kwargs",
-    forceThinking: true,
-    kwargsOn: { chat_template_kwargs: { thinking: true } },
-  },
-
-  // GLM-5.2 is deprecated on NIM as of this update — replaced with
-  // DeepSeek V4 Flash 0731. Unlike GLM-5.2, this parameter shape is taken
-  // directly from NVIDIA's own official sample code at
-  // build.nvidia.com/deepseek-ai/deepseek-v4-flash-0731, not guessed —
-  // their sample explicitly checks for reasoning under either
-  // `.reasoning` or `.reasoning_content`, confirming the broadened
-  // field-detection in mergeReasoningNonStreaming/streaming below.
-  // Caveat (unrelated to config correctness): several NVIDIA developer
-  // forum threads report this specific model hallucinating more than the
-  // model it replaced — worth knowing, not something a proxy can fix.
-  "deepseek-v4-flash-0731": {
-    id: "deepseek-ai/deepseek-v4-flash-0731",
-    mode: "kwargs",
-    kwargsOn: { chat_template_kwargs: { thinking: true, reasoning_effort: "high" } },
-    kwargsOff: { chat_template_kwargs: { thinking: false } },
-  },
-  "deepseek-v4-flash-0731-thinking": {
-    id: "deepseek-ai/deepseek-v4-flash-0731",
-    mode: "kwargs",
-    forceThinking: true,
-    kwargsOn: { chat_template_kwargs: { thinking: true, reasoning_effort: "high" } },
-  },
-
-  // DeepSeek-V4-Pro-0813 — confirmed real on NIM directly against
+  // DeepSeek-V4.1-Flash — replaces ALL prior DeepSeek entries
+  // (deepseek-v4-flash, deepseek-v4-flash-0731, deepseek-v4-pro-0813) as
+  // of this update. Confirmed real and free on NIM directly against
   // NVIDIA's own API reference (docs.api.nvidia.com/nim/reference/
-  // deepseek-ai-deepseek-v4-pro-0813). The larger sibling of Flash-0731:
-  // 1.6T total / 49B active params, native 1M-token context window (no
-  // special parameter needed for that — it's just the model's built-in
-  // limit, same as any other model's context size). Three reasoning
-  // levels: Non-think, Think High, Think Max.
+  // nvidia-deepseek-v4_1-flash). 552B MoE, 8B/16B active, multimodal
+  // (text + image in, text out), native 1M-token context.
   //
-  // Set to "max" (most thorough) by request. Known tradeoff: "max" on
-  // this 1.6T model previously exceeded Vercel's 60s function timeout in
-  // practice, surfacing to Janitor AI as a generic "Failed to fetch" with
-  // no error body (Vercel kills the function before any response is
-  // sent). If that recurs, either switch this back to "high" or use
-  // deepseek-v4-pro-0813 (thinking off) instead.
-  "deepseek-v4-pro-0813-thinking": {
-    id: "deepseek-ai/deepseek-v4-pro-0813",
+  // Reasoning is a CONTINUOUS 1-100 dial on this model, not discrete
+  // tiers — a real architectural change from every other DeepSeek model
+  // in this file. reasoning_effort accepts either a number (1-100) or
+  // "none" to disable entirely. Also: the "thinking" field on this
+  // specific model is a plain BOOLEAN (confirmed from vLLM's own official
+  // serving recipe for this model), unlike GLM-5.3's nested
+  // {type:"enabled"} object — don't copy that shape here, it's wrong for
+  // this model and was deliberately NOT reused.
+  //
+  // Real operational gotcha, confirmed in vLLM's own docs for this exact
+  // model: if NEITHER thinking nor reasoning_effort is set, it defaults
+  // to thinking ON at effort 50 — and a small max_tokens can then get
+  // entirely consumed by the reasoning trace, returning EMPTY actual
+  // content with finish_reason=length (looks like a broken model, isn't
+  // one). Every entry below explicitly sets both fields for exactly this
+  // reason — never leave both unset.
+  "deepseek-v4.1-flash-thinking": {
+    id: "deepseek-ai/deepseek-v4.1-flash",
     mode: "kwargs",
     forceThinking: true,
-    kwargsOn: { chat_template_kwargs: { thinking: true, reasoning_effort: "max" } },
+    kwargsOn: {
+      reasoning_effort: 50,
+      chat_template_kwargs: { thinking: true, enable_thinking: true, reasoning_effort: 50 },
+    },
   },
-  // Identical to the default above now that it's also "max" — kept as an
-  // explicit alias in case the default gets switched back to "high" later.
-  "deepseek-v4-pro-0813-max": {
-    id: "deepseek-ai/deepseek-v4-pro-0813",
+  // Max reasoning effort. This model is much smaller than DeepSeek-V4-
+  // Pro-0813 (552B vs 1.6T total params), so the Vercel-timeout risk
+  // that forced -0813 to default away from "max" is less likely here —
+  // but it's a new model on this proxy, untested at this setting in
+  // practice. Worth testing with the curl command below before relying
+  // on it in a live Janitor AI conversation.
+  "deepseek-v4.1-flash-max": {
+    id: "deepseek-ai/deepseek-v4.1-flash",
     mode: "kwargs",
     forceThinking: true,
-    kwargsOn: { chat_template_kwargs: { thinking: true, reasoning_effort: "max" } },
+    kwargsOn: {
+      reasoning_effort: 100,
+      chat_template_kwargs: { thinking: true, enable_thinking: true, reasoning_effort: 100 },
+    },
   },
-  "deepseek-v4-pro-0813": {
-    id: "deepseek-ai/deepseek-v4-pro-0813",
+  "deepseek-v4.1-flash-fast": {
+    id: "deepseek-ai/deepseek-v4.1-flash",
     mode: "kwargs",
-    kwargsOn: { chat_template_kwargs: { thinking: true, reasoning_effort: "max" } },
-    kwargsOff: { chat_template_kwargs: { thinking: false } },
+    forceThinking: true,
+    kwargsOn: {
+      reasoning_effort: 25,
+      chat_template_kwargs: { thinking: true, enable_thinking: true, reasoning_effort: 25 },
+    },
+  },
+  "deepseek-v4.1-flash": {
+    id: "deepseek-ai/deepseek-v4.1-flash",
+    mode: "kwargs",
+    kwargsOn: {
+      reasoning_effort: 50,
+      chat_template_kwargs: { thinking: true, enable_thinking: true, reasoning_effort: 50 },
+    },
+    kwargsOff: {
+      reasoning_effort: "none",
+      chat_template_kwargs: { thinking: false, enable_thinking: false },
+    },
   },
 
   // Kimi K3 (Moonshot AI) — confirmed real and free on NIM directly
@@ -423,8 +420,46 @@ app.post("/v1/chat/completions", async (req, res) => {
     });
 
     if (!streaming) {
-      const data = await upstream.json();
-      return res.status(upstream.status).json(upstream.ok ? mergeReasoningNonStreaming(data) : data);
+      // NIM doesn't always send a JSON body on error (observed: an empty
+      // body on at least one real 404). Read as text first and try to
+      // parse, rather than calling .json() directly — a parse failure
+      // there was previously surfacing as a misleading "Failed to reach
+      // NVIDIA NIM: Unexpected end of JSON input", which looks like a
+      // network failure when it's actually just an empty/non-JSON
+      // response body from a request that did succeed in reaching NIM.
+      const rawText = await upstream.text();
+
+      if (!upstream.ok) {
+        // Error responses from NIM don't always include a JSON body
+        // (observed: a completely empty body on a real 404). Surface a
+        // clear message either way instead of trying to parse first.
+        let parsedError = null;
+        try {
+          parsedError = rawText ? JSON.parse(rawText) : null;
+        } catch {
+          parsedError = null;
+        }
+        if (parsedError) return res.status(upstream.status).json(parsedError);
+        return res.status(upstream.status).json({
+          error: {
+            message:
+              `NIM returned ${upstream.status} with a non-JSON body` +
+              (rawText ? `: ${rawText.slice(0, 300)}` : " (empty)"),
+          },
+        });
+      }
+
+      // Success case: a genuinely empty body here would be unusual, but
+      // don't crash on it either.
+      let data;
+      try {
+        data = rawText ? JSON.parse(rawText) : {};
+      } catch {
+        return res.status(502).json({
+          error: { message: `NIM returned 200 with an unparseable body: ${rawText.slice(0, 300)}` },
+        });
+      }
+      return res.status(upstream.status).json(mergeReasoningNonStreaming(data));
     }
 
     // Streaming: NIM sends reasoning_content and content as separate delta
