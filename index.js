@@ -29,7 +29,7 @@ app.use(express.json({ limit: "25mb" }));
 
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "*");
+  res.setHeader("Access-Control-Allow-Headers", "*, Authorization, Content-Type");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
@@ -259,6 +259,60 @@ const MODEL_CONFIGS = {
       chat_template_kwargs: { thinking: true, enable_thinking: true, reasoning_effort: "low" },
     },
   },
+
+  // GLM-5.3-Flash (Z.ai) — confirmed in NIM's live catalog for this key
+  // (z-ai/glm-5.3-flash) and documented on NVIDIA's own API reference.
+  // 320B total / 18B active, natively multimodal, 1M context. Thinking is
+  // always on and cannot be disabled. NVIDIA's card and the vLLM recipe for
+  // this exact model say reasoning depth is controlled by reasoning_effort
+  // (low / high / max, default max), passed either top-level or inside
+  // chat_template_kwargs — so both are sent. NVIDIA's card also says chat
+  // use should pass clear_thinking=true (Janitor AI never echoes prior
+  // reasoning back, so there is nothing to preserve).
+  //
+  // Deliberately NOT sending GLM-5.3's nested `thinking: {type: "enabled"}`
+  // object here: the documented shape for this model is the reasoning_effort
+  // field, and extra unrecognized fields are just more things that can go
+  // wrong. Default is "high", not "max", for the same latency reason as the
+  // other large reasoning models on this proxy.
+  "glm-5.3-flash-thinking": {
+    id: "z-ai/glm-5.3-flash",
+    mode: "kwargs",
+    forceThinking: true,
+    kwargsOn: {
+      reasoning_effort: "high",
+      chat_template_kwargs: { reasoning_effort: "high", clear_thinking: true },
+    },
+  },
+  // Bare alias so typing just "glm-5.3-flash" doesn't silently fall back to
+  // the default model.
+  "glm-5.3-flash": {
+    id: "z-ai/glm-5.3-flash",
+    mode: "kwargs",
+    forceThinking: true,
+    kwargsOn: {
+      reasoning_effort: "high",
+      chat_template_kwargs: { reasoning_effort: "high", clear_thinking: true },
+    },
+  },
+  "glm-5.3-flash-max": {
+    id: "z-ai/glm-5.3-flash",
+    mode: "kwargs",
+    forceThinking: true,
+    kwargsOn: {
+      reasoning_effort: "max",
+      chat_template_kwargs: { reasoning_effort: "max", clear_thinking: true },
+    },
+  },
+  "glm-5.3-flash-fast": {
+    id: "z-ai/glm-5.3-flash",
+    mode: "kwargs",
+    forceThinking: true,
+    kwargsOn: {
+      reasoning_effort: "low",
+      chat_template_kwargs: { reasoning_effort: "low", clear_thinking: true },
+    },
+  },
 };
 
 const DEFAULT_MODEL = "nemotron-49b-thinking";
@@ -394,12 +448,37 @@ async function fetchWithRetry(url, options, maxRetries = 2) {
 
     const retryAfterHeader = response.headers.get("retry-after");
     const retryAfterMs = retryAfterHeader ? Number(retryAfterHeader) * 1000 : null;
-    const delayMs = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : 1000 * (attempt + 1);
+    const requestedDelayMs = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : 1000 * (attempt + 1);
+    // Cap the wait: sleeping through a long Retry-After would run into
+    // Vercel's function timeout, and the caller would see a dropped
+    // connection instead of a clean 429.
+    const delayMs = Math.min(requestedDelayMs, 8000);
 
     console.warn(`[nim rate-limited] attempt ${attempt + 1}/${maxRetries + 1}, retrying in ${delayMs}ms`);
     await new Promise((r) => setTimeout(r, delayMs));
   }
   return lastResponse;
+}
+
+// Builds a JSON error body from an upstream (NIM) error response, whether
+// or not NIM actually sent JSON — it doesn't always (an empty body was
+// observed on a real 404).
+function buildErrorPayload(status, rawText) {
+  if (rawText) {
+    try {
+      const parsed = JSON.parse(rawText);
+      if (parsed) return parsed;
+    } catch {
+      // not JSON — fall through to the wrapped message below
+    }
+  }
+  return {
+    error: {
+      message:
+        `NIM returned ${status} with a non-JSON body` +
+        (rawText ? `: ${rawText.slice(0, 300)}` : " (empty)"),
+    },
+  };
 }
 
 app.post("/v1/chat/completions", async (req, res) => {
@@ -412,45 +491,69 @@ app.post("/v1/chat/completions", async (req, res) => {
   const nimBody = buildNimBody(config, reqBody);
   const streaming = !!nimBody.stream;
 
+  // --- Connection handling -------------------------------------------
+  // Callers like Lorebary (and Janitor's own backend) sit between the user
+  // and this proxy, and they drop connections that stay silent too long,
+  // reported to the user as "upstream_transport_error". Large reasoning
+  // models can take a while before NIM answers at all, so:
+  //  - if NIM hasn't responded within 5s on a streaming request, open the
+  //    SSE stream early and send ": keep-alive" comment lines (valid SSE,
+  //    ignored by clients; OpenRouter does the same) every 10s until it does;
+  //  - if the caller hangs up first, cancel the NIM request instead of
+  //    leaving it running.
+  const abort = new AbortController();
+  let clientGone = false;
+  let heartbeat = null;
+  let sseStarted = false;
+
+  const stopHeartbeat = () => {
+    if (heartbeat) {
+      clearTimeout(heartbeat);
+      heartbeat = null;
+    }
+  };
+
+  res.on("close", () => {
+    stopHeartbeat();
+    if (!res.writableFinished) {
+      clientGone = true;
+      abort.abort();
+    }
+  });
+
+  const startSse = () => {
+    if (sseStarted) return;
+    sseStarted = true;
+    res.status(200);
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders?.();
+  };
+
+  if (streaming) {
+    const beat = () => {
+      startSse();
+      res.write(": keep-alive\n\n");
+      heartbeat = setTimeout(beat, 10000);
+    };
+    heartbeat = setTimeout(beat, 5000);
+  }
+
   try {
     const upstream = await fetchWithRetry(`${NIM_BASE}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${NIM_KEY}` },
       body: JSON.stringify(nimBody),
+      signal: abort.signal,
     });
+    stopHeartbeat();
 
     if (!streaming) {
-      // NIM doesn't always send a JSON body on error (observed: an empty
-      // body on at least one real 404). Read as text first and try to
-      // parse, rather than calling .json() directly — a parse failure
-      // there was previously surfacing as a misleading "Failed to reach
-      // NVIDIA NIM: Unexpected end of JSON input", which looks like a
-      // network failure when it's actually just an empty/non-JSON
-      // response body from a request that did succeed in reaching NIM.
       const rawText = await upstream.text();
-
       if (!upstream.ok) {
-        // Error responses from NIM don't always include a JSON body
-        // (observed: a completely empty body on a real 404). Surface a
-        // clear message either way instead of trying to parse first.
-        let parsedError = null;
-        try {
-          parsedError = rawText ? JSON.parse(rawText) : null;
-        } catch {
-          parsedError = null;
-        }
-        if (parsedError) return res.status(upstream.status).json(parsedError);
-        return res.status(upstream.status).json({
-          error: {
-            message:
-              `NIM returned ${upstream.status} with a non-JSON body` +
-              (rawText ? `: ${rawText.slice(0, 300)}` : " (empty)"),
-          },
-        });
+        return res.status(upstream.status).json(buildErrorPayload(upstream.status, rawText));
       }
-
-      // Success case: a genuinely empty body here would be unusual, but
-      // don't crash on it either.
       let data;
       try {
         data = rawText ? JSON.parse(rawText) : {};
@@ -462,21 +565,24 @@ app.post("/v1/chat/completions", async (req, res) => {
       return res.status(upstream.status).json(mergeReasoningNonStreaming(data));
     }
 
+    if (!upstream.ok) {
+      const rawText = await upstream.text().catch(() => "");
+      const payload = buildErrorPayload(upstream.status, rawText);
+      // Normal case: nothing sent yet, so return the real HTTP status.
+      if (!sseStarted) return res.status(upstream.status).json(payload);
+      // We already committed to a 200 stream (to keep the connection
+      // alive), so report the failure inside the stream instead.
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
+
     // Streaming: NIM sends reasoning_content and content as separate delta
     // fields across SSE chunks. We rewrite each chunk so reasoning deltas
     // become normal content deltas wrapped in <think>...</think>, and
     // insert the closing tag right before real content starts — so from
     // Janitor AI's side it's just one continuous text stream.
-    res.status(upstream.status);
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
-
-    if (!upstream.ok) {
-      const text = await upstream.text().catch(() => "");
-      res.write(`data: ${JSON.stringify({ error: { message: text || `NIM returned ${upstream.status}` } })}\n\n`);
-      return res.end();
-    }
+    startSse();
 
     const reader = upstream.body.getReader();
     const decoder = new TextDecoder();
@@ -533,9 +639,18 @@ app.post("/v1/chat/completions", async (req, res) => {
     }
     res.end();
   } catch (err) {
+    stopHeartbeat();
+    if (clientGone) return; // the caller hung up; nobody left to tell
     if (!res.headersSent) {
       res.status(502).json({ error: { message: `Failed to reach NVIDIA NIM: ${err.message}` } });
     } else {
+      // Mid-stream failure: tell the client instead of silently cutting off.
+      try {
+        res.write(`data: ${JSON.stringify({ error: { message: `Stream interrupted: ${err.message}` } })}\n\n`);
+        res.write("data: [DONE]\n\n");
+      } catch {
+        // connection already gone
+      }
       res.end();
     }
   }

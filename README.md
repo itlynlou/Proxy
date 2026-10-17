@@ -50,22 +50,19 @@ rewrite. If you ever see `Cannot POST /api` again after this fix, the
 | `nemotron-nano-9b-thinking` | always on | smaller/faster |
 | `nemotron-nano-9b` | off | smaller/faster |
 | `nemotron-omni-30b-thinking` | always on (reasoning-only checkpoint) | no non-thinking variant exists |
-| `deepseek-v4-flash-thinking` | always on | best-effort — see caveat below |
-| `deepseek-v4-flash` | off | best-effort — see caveat below |
-| `deepseek-v4-flash-0731-thinking` | always on | newer checkpoint; request shape confirmed against NVIDIA's own official sample code |
-| `deepseek-v4-flash-0731` | off | see hallucination caveat below |
-| `deepseek-v4-pro-0813-thinking` | always on (`reasoning_effort: max`) | 1.6T/49B active, native 1M-token context — **may exceed Vercel Hobby's 60s timeout**, see caveat below |
-| `deepseek-v4-pro-0813-max` | same as above | identical alias, kept in case the default changes back to `high` later |
-| `deepseek-v4-pro-0813` | off | same model, faster/cheaper without reasoning |
+| `deepseek-v4.1-flash-thinking` | always on, effort 50/100 | 552B MoE, 8B/16B active, multimodal (text+image in), 1M context — replaces all prior DeepSeek models |
+| `deepseek-v4.1-flash-max` | always on, effort 100 | most thorough — untested at this setting in practice, see caveat below |
+| `deepseek-v4.1-flash-fast` | always on, effort 25 | quickest option |
+| `deepseek-v4.1-flash` | effort 50 by default, respects `thinking:false` override | same model, can be fully disabled unlike the other variants |
 | `kimi-k3-thinking` | always on, `reasoning_effort: high` (can't be disabled) | 2.8T/104B active, 1M context — see multi-turn caveat below |
 | `kimi-k3-max` | always on, `reasoning_effort: max` | most thorough, risks the same Vercel timeout DeepSeek-Pro-max hit |
 | `kimi-k3-fast` | always on, `reasoning_effort: low` | quickest option for simple messages |
-| `glm-5.3-thinking` | always on, `reasoning_effort: high` (can't be disabled) | 753B MoE, 1M context |
+| `glm-5.3-thinking` | always on, `reasoning_effort: high` (can't be disabled) | 753B MoE, 1M context. NIM has been returning an empty 404 for this model (NVIDIA-side, not a proxy bug) |
 | `glm-5.3-max` | always on, `reasoning_effort: max` | most thorough — may hit the same Vercel timeout risk as DeepSeek-Pro-max |
 | `glm-5.3-fast` | always on, `reasoning_effort: low` | quickest option |
-| `glm-5.3-thinking` | always on (can't be disabled), `reasoning_effort: high` | 753B/40B active, 1M context |
-| `glm-5.3-max` | always on, `reasoning_effort: max` | most thorough, risks the same Vercel timeout DeepSeek-Pro-max hit |
-| `glm-5.3-fast` | always on, `reasoning_effort: low` | quickest option |
+| `glm-5.3-flash-thinking` (also just `glm-5.3-flash`) | always on, `reasoning_effort: high` (can't be disabled) | 320B MoE / 18B active, natively multimodal, 1M context. A separate deployment from `glm-5.3`, so it may work when `glm-5.3` 404s (not guaranteed) |
+| `glm-5.3-flash-max` | always on, `reasoning_effort: max` | most thorough, slowest |
+| `glm-5.3-flash-fast` | always on, `reasoning_effort: low` | quickest option |
 
 **Any other NVIDIA NIM model works too** — just send its real model id (the
 kind with a `/` in it, e.g. `qwen/qwen3-235b-a22b`,
@@ -90,32 +87,31 @@ family does it differently:
   docs.
 - **`nemotron-nano-9b*`** — a `/think` or `/no_think` suffix appended to
   the system prompt. Also confirmed in NVIDIA's own docs.
-- **`nemotron-omni-30b-thinking`, `deepseek-v4-flash*`,
-  `deepseek-v4-flash-0731*`, `deepseek-v4-pro-0813*`** — a
-  `chat_template_kwargs` / `reasoning_effort` parameter in the request
-  body. The `-0731` variant's request shape is confirmed directly from
-  NVIDIA's own official sample code at
-  build.nvidia.com/deepseek-ai/deepseek-v4-flash-0731; `-0813` uses the
-  same confirmed shape scaled up. The other two (`deepseek-v4-flash`,
-  `nemotron-omni-30b`) are community-sourced and best-effort. **Caveat for
-  `deepseek-v4-flash-0731` specifically:** several recent NVIDIA developer
-  forum threads report this checkpoint hallucinating more than the model
-  it replaced — worth knowing going in, not something a proxy can fix.
-  **Note on `-0813`:** some third-party sources claim it thinks by default
-  with no extra parameters — that exact claim about GLM-5.2 turned out to
-  be false on NVIDIA's actual endpoint, so `deepseek-v4-pro-0813-thinking`
-  explicitly forces `reasoning_effort` rather than trusting it. Currently
-  set to `"max"` (most thorough) — this previously caused this exact
-  model to exceed Vercel's 60-second function timeout in practice, which
-  showed up in Janitor AI as a generic `"Failed to fetch"` with no error
-  body at all (Vercel kills the function before any response gets sent,
-  so there's nothing for this proxy's own error handling to catch or
-  log). If that happens again, switch to `reasoning_effort: "high"` in
-  `api/index.js` (meaningfully faster, still strong per DeepSeek's own
-  benchmarks) or use `deepseek-v4-pro-0813` (thinking off).
-  If a model in this group stops showing a `<think>` block, check
-  `GET /v1/models` on your proxy and the model's own page at
-  build.nvidia.com — the exact parameter name may have changed.
+- **`nemotron-omni-30b-thinking`** — a `chat_template_kwargs` parameter,
+  community-sourced and best-effort (not in NVIDIA's own docs directly).
+- **`deepseek-v4.1-flash*`** — unlike every other DeepSeek model this
+  proxy has used, reasoning here is a **continuous 1–100 dial**
+  (`reasoning_effort`), not discrete tiers — confirmed from vLLM's own
+  official serving recipe for this exact model
+  (recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash). `"none"` turns
+  thinking off entirely. The `thinking` field on this model is a plain
+  **boolean**, not an object — different from GLM-5.3's
+  `{type: "enabled"}` shape, deliberately not reused here.
+  **A real gotcha baked around, not just documented:** this model's own
+  docs confirm that if neither `thinking` nor `reasoning_effort` is set,
+  it defaults to thinking ON at effort 50 — and a small `max_tokens` can
+  then get entirely consumed by the reasoning trace, returning **empty
+  actual content** with `finish_reason=length` (looks like a broken
+  model; isn't one). Every variant in this proxy explicitly sets both
+  fields for exactly this reason, so this failure mode shouldn't be
+  reachable through Janitor AI — if a reply does come back empty, that's
+  the first thing to check.
+  **`deepseek-v4.1-flash-max` is untested at full effort in practice** —
+  this model is much smaller than the old DeepSeek-V4-Pro-0813 (552B vs
+  1.6T total params), so the Vercel-timeout issue that forced `-0813`
+  away from `"max"` by default is less likely here, but hasn't actually
+  been confirmed fast enough. Worth testing with the curl command below
+  before relying on it live.
 - **`glm-5.3*`** — Z.ai's own format uses a top-level `thinking:
   {type: "enabled"}` object plus a top-level `reasoning_effort` field,
   different again from DeepSeek's `chat_template_kwargs` shape. This
@@ -167,6 +163,52 @@ back. Practically: expect Kimi K3's reasoning quality in Janitor AI to
 hold up fine for shorter exchanges, but potentially drift on very long
 roleplay sessions. This is a limitation of what Janitor AI's client
 sends, not something fixable by changing this proxy's code.
+
+## Connection errors through Lorebary / the Janitor app (`upstream_transport_error`)
+
+If you route Janitor AI → Lorebary → this proxy, the request passes through
+more than one server. `upstream_transport_error` ("The AI provider could not
+be reached") means a connection in that chain dropped or timed out before
+any response arrived. It is not an error message from the model. The Play
+Store app and the browser can behave differently here (for example in
+timeouts or whether replies are streamed), which is why one can work while
+the other fails.
+
+What this version does about it:
+
+- **Keep-alive on slow streams.** If NIM hasn't started answering within 5
+  seconds, the proxy opens the stream anyway and sends `: keep-alive`
+  comment lines every 10 seconds (valid SSE that clients ignore), so
+  intermediaries don't treat the silence as a dead connection.
+- **Capped 429 waiting.** The retry wait is capped at 8 seconds. Before, a
+  long `Retry-After` could run into Vercel's 60s limit and the caller saw a
+  dropped connection instead of a clean 429.
+- **Hang-ups cancel the NIM request** instead of leaving it running.
+- **Mid-stream failures are reported** inside the stream instead of the
+  reply just cutting off.
+- `Authorization` is now listed explicitly in the CORS headers (the bare
+  `*` wildcard does not cover it in browsers).
+
+What it can't fix:
+
+- **Non-streaming requests** send nothing until the whole reply is done, so
+  there is nothing to keep alive. If the app uses non-streaming and a reply
+  takes longer than Vercel's 60s limit, the connection is cut. Use a faster
+  variant (`-fast`, or a non-reasoning model), or turn streaming on if your
+  Janitor settings allow it.
+- **Lorebary or Janitor-side settings.** After changing a proxy URL or
+  model, reload the Janitor page or app fully. The connection settings are
+  read when the chat loads, so a saved but not reloaded change looks
+  exactly like a broken proxy. Lorebary reportedly has a status page at
+  status.lorebary.com worth checking if everything fails at once.
+
+Quickest way to tell where the break is: watch your Vercel project's live
+logs while sending a message from the app. If no request from Lorebary
+appears at all, the problem is before this proxy (Lorebary URL/config, or
+the app not reaching Lorebary). If requests appear but run long or time
+out, it's a latency problem and the fixes above apply. Also try a fast
+non-reasoning model (`nemotron-nano-9b`) in the app: if that works and the
+big reasoning models don't, it's timeouts rather than a wrong URL.
 
 ## Quick manual test
 
