@@ -45,10 +45,6 @@ rewrite. If you ever see `Cannot POST /api` again after this fix, the
 
 | Model | Thinking | Notes |
 |---|---|---|
-| `nemotron-49b-thinking` | always on | 49B, reliable, official NVIDIA reasoning docs |
-| `nemotron-49b` | off | same model, concise answers |
-| `nemotron-nano-9b-thinking` | always on | smaller/faster |
-| `nemotron-nano-9b` | off | smaller/faster |
 | `nemotron-omni-30b-thinking` | always on (reasoning-only checkpoint) | no non-thinking variant exists |
 | `deepseek-v4.1-flash-thinking` | always on, effort 50/100 | 552B MoE, 8B/16B active, multimodal (text+image in), 1M context — replaces all prior DeepSeek models |
 | `deepseek-v4.1-flash-max` | always on, effort 100 | most thorough — untested at this setting in practice, see caveat below |
@@ -75,18 +71,15 @@ models above get that normalization). See the full live catalog:
 curl https://your-project-name.vercel.app/v1/models
 ```
 
-Default if you send an unrecognized model name: `nemotron-49b-thinking`.
+Default if you send an unrecognized model name (including the removed `nemotron-*` names): `deepseek-v4.1-flash-thinking`. This default is not guaranteed to be up either, which is why the automatic fallback below exists.
 
 ## How thinking mode actually works here
 
 NVIDIA NIM has no single standard way to toggle reasoning — each model
 family does it differently:
 
-- **`nemotron-49b*`** — a literal system-prompt string, `"detailed
-  thinking on"` / `"detailed thinking off"`. Confirmed in NVIDIA's own
-  docs.
-- **`nemotron-nano-9b*`** — a `/think` or `/no_think` suffix appended to
-  the system prompt. Also confirmed in NVIDIA's own docs.
+- **Removed:** the old `nemotron-49b*` and `nemotron-nano-9b*` models
+  (see "Retired models" below).
 - **`nemotron-omni-30b-thinking`** — a `chat_template_kwargs` parameter,
   community-sourced and best-effort (not in NVIDIA's own docs directly).
 - **`deepseek-v4.1-flash*`** — unlike every other DeepSeek model this
@@ -144,10 +137,12 @@ and prepended to the actual reply, so it shows up right in the chat
 message, followed by the real answer. Works the same for both streamed
 and non-streamed responses.
 
-If you'd rather not see the reasoning trace inline in Janitor AI, use the
-non-thinking variant of a model (e.g. `nemotron-49b` instead of
-`nemotron-49b-thinking`) — the omni-30b and Kimi K3 models are
-reasoning-only, so there's no way to turn thinking off for those.
+Janitor AI has no way to send this proxy's thinking on/off flag, so every
+named model here shows its reasoning. The `-fast` variants think the
+least. If you want replies with no reasoning trace at all, use a raw model
+id from NVIDIA's catalog (anything with a `/`, like `vendor/model-name`):
+those pass straight through with no thinking handling. Check `/status`
+and the catalog first, since retired ids answer 410.
 
 ## Kimi K3's multi-turn limitation (can't be fixed at the proxy level)
 
@@ -163,6 +158,50 @@ back. Practically: expect Kimi K3's reasoning quality in Janitor AI to
 hold up fine for shorter exchanges, but potentially drift on very long
 roleplay sessions. This is a limitation of what Janitor AI's client
 sends, not something fixable by changing this proxy's code.
+
+## Retired models (HTTP 410), automatic fallback, and `/status`
+
+NVIDIA retires NIM models without much notice. A retired model answers
+**HTTP 410 Gone** on every request, and Janitor AI shows that as "The AI
+provider returned an unexpected response (410)". That is what happened with
+`nemotron-49b-thinking`: reports I found say NVIDIA ended
+`nvidia/llama-3.3-nemotron-super-49b-v1` (and its v1.5) on 2026-08-26, and
+`nvidia-nemotron-nano-9b-v2` returns 410 too. An earlier version of this
+README called the 49B model the reliable choice, and the proxy used it as
+the default for any unrecognized name. Both were wrong by the time you hit
+it. **Those models are now removed.** If Janitor still has one of the old
+names saved, it lands on the default model instead of an error.
+
+What the proxy does about this now:
+
+- **Automatic fallback.** If a named model answers 404 or 410, the proxy
+  tries the next one in this order: `deepseek-v4.1-flash-thinking`,
+  `glm-5.3-flash-thinking`, `nemotron-omni-30b-thinking`,
+  `kimi-k3-thinking` (at most 4 attempts). Each fallback model gets its
+  own correct request settings. A raw `vendor/model` id you typed yourself
+  is never swapped: you get that model or its real error. If every
+  candidate fails, you get the real error of the model you asked for.
+  Change the order with the `NIM_FALLBACK_MODELS` env var (comma-separated
+  alias names).
+- **`GET /status`** sends one tiny real request per model and reports what
+  actually came back, including NVIDIA's own reason (for example "reached
+  its end of life"). Open `https://YOUR-PROJECT.vercel.app/status` in your
+  phone browser. Results are cached for 5 minutes because each check uses a
+  little of your NVIDIA quota; add `?fresh=1` to force a re-check.
+- Being listed in `/v1/models` does **not** mean a model answers. That list
+  is NVIDIA's catalog, and GLM-5.3 was listed while failing.
+
+Things to know:
+
+- A fallback means a different model answered than the one you picked.
+  Janitor won't show that. The response carries an `x-nim-model-used`
+  header, and Vercel's logs show a `[fallback]` line.
+- I could not test any of this against NVIDIA live from where I work. The
+  fallback and `/status` logic are tested against a mock server, and the
+  retirement dates come from NVIDIA developer-forum posts and a public
+  probe of NVIDIA's endpoint, not from my own check. I also have not seen
+  the DeepSeek, GLM-Flash, omni or Kimi models answer for your key. `/status`
+  is how you find out which ones do.
 
 ## Connection errors through Lorebary / the Janitor app (`upstream_transport_error`)
 
@@ -207,8 +246,8 @@ logs while sending a message from the app. If no request from Lorebary
 appears at all, the problem is before this proxy (Lorebary URL/config, or
 the app not reaching Lorebary). If requests appear but run long or time
 out, it's a latency problem and the fixes above apply. Also try a fast
-non-reasoning model (`nemotron-nano-9b`) in the app: if that works and the
-big reasoning models don't, it's timeouts rather than a wrong URL.
+variant (`deepseek-v4.1-flash-fast`) in the app: if that works and the
+slower models don't, it's timeouts rather than a wrong URL.
 
 ## Quick manual test
 
@@ -216,7 +255,7 @@ big reasoning models don't, it's timeouts rather than a wrong URL.
 curl -i https://your-project-name.vercel.app/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "nemotron-49b-thinking",
+    "model": "deepseek-v4.1-flash-thinking",
     "messages": [{"role": "user", "content": "What is 17 * 24?"}]
   }'
 ```

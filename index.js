@@ -54,40 +54,17 @@ if (!NIM_KEY) {
 // (what you'll put in Janitor AI) to the real NIM model id and how to
 // switch its thinking mode on/off.
 //
-// "system_prompt" and "system_suffix" entries are confirmed against
-// NVIDIA's own docs (docs.nvidia.com/nim/large-language-models). "kwargs"
-// entries (DeepSeek V4, the omni-reasoning Nemotron) are sourced from
-// community tooling rather than NVIDIA's official docs, since NVIDIA
-// doesn't document those specific parameters directly — treat those two
-// as best-effort and check GET /v1/models if one starts erroring.
+// NVIDIA retires NIM models without much notice (a retired id answers
+// HTTP 410 Gone), and a model can be listed in /v1/models while still
+// failing. Use GET /status on this proxy to see which of these actually
+// answer right now. If a curated model returns 404/410, the proxy
+// automatically tries the next one in FALLBACK_MODELS (see below).
 const MODEL_CONFIGS = {
-  // Official NVIDIA docs: literal system-prompt strings toggle reasoning.
-  "nemotron-49b": {
-    id: "nvidia/llama-3.3-nemotron-super-49b-v1",
-    mode: "system_prompt",
-    on: "detailed thinking on",
-    off: "detailed thinking off",
-  },
-  "nemotron-49b-thinking": {
-    id: "nvidia/llama-3.3-nemotron-super-49b-v1",
-    mode: "system_prompt",
-    forceThinking: true,
-    on: "detailed thinking on",
-  },
-
-  // Official NVIDIA docs: /think or /no_think suffix on the system prompt.
-  "nemotron-nano-9b": {
-    id: "nvidia/nvidia-nemotron-nano-9b-v2",
-    mode: "system_suffix",
-    on: " /think",
-    off: " /no_think",
-  },
-  "nemotron-nano-9b-thinking": {
-    id: "nvidia/nvidia-nemotron-nano-9b-v2",
-    mode: "system_suffix",
-    forceThinking: true,
-    on: " /think",
-  },
+  // REMOVED: nemotron-49b*, nemotron-nano-9b*. NVIDIA retired
+  // nvidia/llama-3.3-nemotron-super-49b-v1 (and v1.5) and
+  // nvidia/nvidia-nemotron-nano-9b-v2 around 2026-08-26 — they now answer
+  // HTTP 410 Gone on every request. These used to be this proxy's default
+  // and its recommended "safe" models.
 
   // Community-sourced (chat_template_kwargs) — this checkpoint is
   // reasoning-only, so there's no "thinking off" variant.
@@ -315,7 +292,21 @@ const MODEL_CONFIGS = {
   },
 };
 
-const DEFAULT_MODEL = "nemotron-49b-thinking";
+// Used when the requested name isn't recognized (e.g. an old alias saved in
+// Janitor AI). Must be a model that is actually being served.
+const DEFAULT_MODEL = "deepseek-v4.1-flash-thinking";
+
+// If a curated model answers 404 or 410 (retired / not served for this
+// account), the proxy retries with these, in order, instead of failing the
+// chat. Raw "vendor/model" ids typed by hand are NOT substituted — if you
+// ask for a specific id you get that id or its real error. Override with a
+// comma-separated list of alias names in the NIM_FALLBACK_MODELS env var.
+const MODEL_UNAVAILABLE_STATUSES = new Set([404, 410]);
+const FALLBACK_MODELS = (
+  process.env.NIM_FALLBACK_MODELS
+    ? process.env.NIM_FALLBACK_MODELS.split(",").map((k) => k.trim())
+    : ["deepseek-v4.1-flash-thinking", "glm-5.3-flash-thinking", "nemotron-omni-30b-thinking", "kimi-k3-thinking"]
+).filter((key) => MODEL_CONFIGS[key]);
 
 // Any model NOT in MODEL_CONFIGS is treated as a raw NIM model id and
 // passed straight through with no thinking-mode manipulation (harmless —
@@ -397,6 +388,8 @@ app.get("/", (req, res) => {
   res.json({
     status: "ok",
     message: "Janitor AI <-> NVIDIA NIM proxy is running",
+    default_model: DEFAULT_MODEL,
+    check_what_works_now: "/status",
     models: Object.keys(MODEL_CONFIGS),
   });
 });
@@ -430,6 +423,90 @@ app.get("/v1/models", async (req, res) => {
     // than erroring outright.
     res.json({ object: "list", data: curated, warning: `Could not reach NIM's live catalog: ${err.message}` });
   }
+});
+
+// ---- GET /status ---------------------------------------------------------
+// "Is it in the catalog?" is not the same as "does it answer?" — NVIDIA
+// retires models (HTTP 410 Gone) and some listed models fail for specific
+// accounts (404). This sends one tiny real request per distinct upstream
+// model and reports what actually came back. Cached for 5 minutes (each
+// check spends a little of your NVIDIA quota); add ?fresh=1 to re-check.
+const STATUS_TTL_MS = 5 * 60 * 1000;
+let statusCache = { at: 0, data: null };
+
+function summarizeUpstreamError(text) {
+  if (!text) return "empty response body";
+  try {
+    const parsed = JSON.parse(text);
+    const message = parsed?.detail || parsed?.error?.message || parsed?.message || parsed?.title;
+    if (message) return String(message).slice(0, 200);
+  } catch {
+    // not JSON — fall through
+  }
+  return text.slice(0, 200);
+}
+
+app.get("/status", async (req, res) => {
+  if (!NIM_KEY) {
+    return res.status(500).json({ error: { message: "Proxy misconfigured: NVIDIA_API_KEY env var is not set." } });
+  }
+  const fresh = parseUrl(req.url, true).query.fresh === "1";
+  if (!fresh && statusCache.data && Date.now() - statusCache.at < STATUS_TTL_MS) {
+    return res.json({ ...statusCache.data, cached: true });
+  }
+
+  // One probe per distinct upstream model id, not per alias.
+  const probes = new Map();
+  for (const [alias, cfg] of Object.entries(MODEL_CONFIGS)) {
+    if (!probes.has(cfg.id)) probes.set(cfg.id, { cfg, aliases: [] });
+    probes.get(cfg.id).aliases.push(alias);
+  }
+
+  const results = await Promise.all(
+    [...probes.entries()].map(async ([id, { cfg, aliases }]) => {
+      const started = Date.now();
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 20000);
+      try {
+        const body = buildNimBody(cfg, { messages: [{ role: "user", content: "hi" }], max_tokens: 8 });
+        const r = await fetch(`${NIM_BASE}/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${NIM_KEY}` },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+        const text = await r.text().catch(() => "");
+        return {
+          model: id,
+          aliases,
+          status: r.status,
+          ok: r.ok,
+          detail: r.ok ? "answers" : summarizeUpstreamError(text),
+          ms: Date.now() - started,
+        };
+      } catch (err) {
+        return {
+          model: id,
+          aliases,
+          status: 0,
+          ok: false,
+          detail: err.name === "AbortError" ? "no answer within 20s" : err.message,
+          ms: Date.now() - started,
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+    })
+  );
+
+  const data = {
+    checked_at: new Date().toISOString(),
+    working_aliases: results.filter((r) => r.ok).flatMap((r) => r.aliases),
+    not_working: results.filter((r) => !r.ok).map((r) => ({ model: r.model, status: r.status, detail: r.detail })),
+    results,
+  };
+  statusCache = { at: Date.now(), data };
+  res.json({ ...data, cached: false });
 });
 
 // NVIDIA NIM's free tier is rate-limited per-minute (not just a daily
@@ -488,8 +565,23 @@ app.post("/v1/chat/completions", async (req, res) => {
 
   const reqBody = req.body || {};
   const config = resolveModel(reqBody.model);
-  const nimBody = buildNimBody(config, reqBody);
-  const streaming = !!nimBody.stream;
+  const streaming = !!reqBody.stream;
+
+  // Candidate models, in order. A hand-typed raw "vendor/model" id gets just
+  // itself; a curated alias (or an unrecognized name that fell back to the
+  // default) is followed by the fallback chain, deduplicated by upstream id.
+  const candidates = [config];
+  if (config.mode !== "passthrough") {
+    const seenIds = new Set([config.id]);
+    for (const key of FALLBACK_MODELS) {
+      const candidate = { key, ...MODEL_CONFIGS[key] };
+      if (!seenIds.has(candidate.id)) {
+        seenIds.add(candidate.id);
+        candidates.push(candidate);
+      }
+    }
+    candidates.length = Math.min(candidates.length, 4);
+  }
 
   // --- Connection handling -------------------------------------------
   // Callers like Lorebary (and Janitor's own backend) sit between the user
@@ -541,13 +633,42 @@ app.post("/v1/chat/completions", async (req, res) => {
   }
 
   try {
-    const upstream = await fetchWithRetry(`${NIM_BASE}/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${NIM_KEY}` },
-      body: JSON.stringify(nimBody),
-      signal: abort.signal,
-    });
+    // Try each candidate until one is not "model unavailable" (404/410).
+    // Other failures (429, 5xx, auth) are returned as-is: they say nothing
+    // about whether the model itself exists.
+    let upstream = null;
+    let used = null;
+    let firstUnavailable = null;
+    for (const candidate of candidates) {
+      const response = await fetchWithRetry(`${NIM_BASE}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${NIM_KEY}` },
+        body: JSON.stringify(buildNimBody(candidate, reqBody)),
+        signal: abort.signal,
+      });
+      if (response.ok || !MODEL_UNAVAILABLE_STATUSES.has(response.status)) {
+        upstream = response;
+        used = candidate;
+        break;
+      }
+      console.warn(`[model unavailable] ${candidate.id} -> HTTP ${response.status}`);
+      if (!firstUnavailable) firstUnavailable = { response, candidate };
+      else await response.body?.cancel?.().catch(() => {});
+    }
+    if (!upstream) {
+      // Everything was unavailable: report the FIRST model's real error, not
+      // the last fallback's, since that's the one that was actually asked for.
+      upstream = firstUnavailable.response;
+      used = firstUnavailable.candidate;
+    } else if (firstUnavailable) {
+      await firstUnavailable.response.body?.cancel?.().catch(() => {});
+      console.warn(`[fallback] ${firstUnavailable.candidate.id} unavailable, answered by ${used.id}`);
+    }
     stopHeartbeat();
+    if (!res.headersSent) {
+      res.setHeader("x-nim-model-used", used.id);
+      if (used !== candidates[0]) res.setHeader("x-proxy-fallback-from", candidates[0].id);
+    }
 
     if (!streaming) {
       const rawText = await upstream.text();
