@@ -1,7 +1,15 @@
 import express from "express";
-import { parse as parseUrl } from "node:url";
 
 const app = express();
+
+// Reads the query string of a request URL with the standard URLSearchParams
+// (instead of Node's legacy URL parser, which is deprecated). It deliberately
+// parses only the part after "?" rather than building a full URL, so a
+// request path that starts with "//" can never be mistaken for a hostname.
+function queryOf(url) {
+  const i = url.indexOf("?");
+  return new URLSearchParams(i === -1 ? "" : url.slice(i + 1));
+}
 
 // The vercel.json rewrite forwards every request to this single function
 // as "/api?path=<real-path>", passing the actual requested path through
@@ -14,10 +22,11 @@ const app = express();
 // original query params (e.g. our own "?all=1" on /v1/models) are
 // preserved alongside the reconstructed path.
 app.use((req, res, next) => {
-  const parsed = parseUrl(req.url, true);
-  if (typeof parsed.query.path === "string") {
-    const { path, ...rest } = parsed.query;
-    const search = new URLSearchParams(rest).toString();
+  const params = queryOf(req.url);
+  const path = params.get("path");
+  if (path !== null) {
+    params.delete("path");
+    const search = params.toString();
     req.url = "/" + path + (search ? `?${search}` : "");
   }
   // If "path" isn't present (e.g. local dev via `node api/index.js`,
@@ -450,7 +459,7 @@ app.get("/status", async (req, res) => {
   if (!NIM_KEY) {
     return res.status(500).json({ error: { message: "Proxy misconfigured: NVIDIA_API_KEY env var is not set." } });
   }
-  const fresh = parseUrl(req.url, true).query.fresh === "1";
+  const fresh = queryOf(req.url).get("fresh") === "1";
   if (!fresh && statusCache.data && Date.now() - statusCache.at < STATUS_TTL_MS) {
     return res.json({ ...statusCache.data, cached: true });
   }
