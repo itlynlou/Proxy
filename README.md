@@ -249,6 +249,14 @@ out, it's a latency problem and the fixes above apply. Also try a fast
 variant (`deepseek-v4.1-flash-fast`) in the app: if that works and the
 slower models don't, it's timeouts rather than a wrong URL.
 
+**Connection checkers that use a plain GET.** Some testers probe the URL
+you give them before sending a chat; the Vercel log showed `axios/1.18.1`
+sending `GET /v1/chat/completions`. Chats need POST, so that used to get a
+404 and could be reported as unreachable. These GET probes now get a 200
+with a short explanation, and any URL that matches no route returns a JSON
+404 naming the method and path it saw. A base URL entered without `/v1`
+(requests to `/chat/completions` or `/models`) is also accepted.
+
 ## Quick manual test
 
 ```bash

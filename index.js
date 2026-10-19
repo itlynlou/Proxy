@@ -34,6 +34,13 @@ app.use((req, res, next) => {
   next();
 });
 
+// Tolerate a base URL that was entered without "/v1": a client appending its
+// own path then asks for /chat/completions or /models directly.
+app.use((req, res, next) => {
+  if (/^\/(chat\/completions|models)(\?|$)/.test(req.url)) req.url = "/v1" + req.url;
+  next();
+});
+
 app.use(express.json({ limit: "25mb" }));
 
 app.use((req, res, next) => {
@@ -402,6 +409,23 @@ app.get("/", (req, res) => {
     models: Object.keys(MODEL_CONFIGS),
   });
 });
+
+// Connection checkers (Lorebary, Janitor, uptime monitors) often probe the
+// URL you give them with a plain GET before ever sending a chat. Real chats
+// are POST-only, so those probes used to get a 404 (the Vercel log showed
+// axios/1.18.1 sending GET /v1/chat/completions) and could be reported as
+// "unreachable". Answer them with a 200 that says how to use the endpoint.
+function probeReply(req, res) {
+  res.json({
+    status: "ok",
+    message: "This proxy is reachable. Real chats are sent here as POST requests with an OpenAI-style JSON body.",
+    path: req.url.split("?")[0],
+    models: "/v1/models",
+    check_what_works_now: "/status",
+  });
+}
+app.get("/v1", probeReply);
+app.get("/v1/chat/completions", probeReply);
 
 app.get("/v1/models", async (req, res) => {
   const curated = Object.keys(MODEL_CONFIGS).map((id) => ({
@@ -784,6 +808,16 @@ app.post("/v1/chat/completions", async (req, res) => {
       res.end();
     }
   }
+});
+
+// Anything that matched no route: answer in JSON and say exactly what was
+// requested, so a mismatched URL is obvious in logs and client error messages.
+app.use((req, res) => {
+  res.status(404).json({
+    error: {
+      message: `No route for ${req.method} ${req.url.split("?")[0]}. Chats go to POST /v1/chat/completions; the model list is GET /v1/models.`,
+    },
+  });
 });
 
 app.use((err, req, res, next) => {
