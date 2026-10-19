@@ -203,6 +203,41 @@ Things to know:
   the DeepSeek, GLM-Flash, omni or Kimi models answer for your key. `/status`
   is how you find out which ones do.
 
+## When a reply hangs or fails: time limits, slow-model fallback, `/debug/recent`
+
+One real request on this deployment ran **2 minutes 39 seconds** and ended
+in an HTTP 400, while Lorebary's page showed "Could not reach the endpoint.
+Network error or CORS issue." A browser page won't wait that long. Also, the
+60-second `maxDuration` in `vercel.json` did **not** stop that request, so
+don't count on it as a safety net (I described it that way earlier, and this
+log shows it isn't what limits you).
+
+What changed:
+
+- **A time limit for NVIDIA to start answering**: 30 seconds for streaming
+  requests, 60 for non-streaming, 90 in total across models. If a model
+  doesn't start in time, the proxy moves on to the next model in the
+  fallback chain. If nothing answers, you get a clear JSON 504 naming what
+  was tried instead of a hang. Override with the env vars
+  `NIM_FIRST_RESPONSE_MS`, `NIM_NONSTREAM_RESPONSE_MS` and
+  `NIM_TOTAL_BUDGET_MS`. Trade-off: a healthy but slow model (for example a
+  big reasoning model at `max` effort on a non-streaming request) can be cut
+  off and replaced by a faster one. Raise the limits if you would rather wait.
+- **CORS headers now come before body parsing.** A malformed or oversized
+  JSON body used to be rejected with a reply that had no CORS headers, which
+  a browser reports as "Network error or CORS issue" instead of the real
+  error.
+- **`GET /debug/recent`** lists the last 30 chat requests: the model asked
+  for and the one that answered, every attempt and how long it took,
+  NVIDIA's own error text, the request size, which parameter names the
+  caller sent, and who called (browser or server). It never includes the
+  prompt text. It lives in memory, so it only covers the server instance
+  that is currently running and resets after a redeploy or a long idle.
+
+What is still unknown: why NVIDIA answered that request with a 400. I never
+saw its message. If it happens again, open `/debug/recent` right after the
+failure and send me the newest entry.
+
 ## Connection errors through Lorebary / the Janitor app (`upstream_transport_error`)
 
 If you route Janitor AI → Lorebary → this proxy, the request passes through
@@ -220,7 +255,7 @@ What this version does about it:
   comment lines every 10 seconds (valid SSE that clients ignore), so
   intermediaries don't treat the silence as a dead connection.
 - **Capped 429 waiting.** The retry wait is capped at 8 seconds. Before, a
-  long `Retry-After` could run into Vercel's 60s limit and the caller saw a
+  long `Retry-After` could keep the request hanging until the caller gave up, so it saw a
   dropped connection instead of a clean 429.
 - **Hang-ups cancel the NIM request** instead of leaving it running.
 - **Mid-stream failures are reported** inside the stream instead of the
@@ -232,7 +267,7 @@ What it can't fix:
 
 - **Non-streaming requests** send nothing until the whole reply is done, so
   there is nothing to keep alive. If the app uses non-streaming and a reply
-  takes longer than Vercel's 60s limit, the connection is cut. Use a faster
+  takes very long, the caller (Lorebary, Janitor or a browser) may give up before it arrives. Use a faster
   variant (`-fast`, or a non-reasoning model), or turn streaming on if your
   Janitor settings allow it.
 - **Lorebary or Janitor-side settings.** After changing a proxy URL or
@@ -255,7 +290,9 @@ sending `GET /v1/chat/completions`. Chats need POST, so that used to get a
 404 and could be reported as unreachable. These GET probes now get a 200
 with a short explanation, and any URL that matches no route returns a JSON
 404 naming the method and path it saw. A base URL entered without `/v1`
-(requests to `/chat/completions` or `/models`) is also accepted.
+(requests to `/chat/completions` or `/models`) is also accepted, and a
+POST to the bare base URL (`/v1` or `/`) is treated as a chat request,
+since some clients post to exactly the URL they were given.
 
 ## Quick manual test
 

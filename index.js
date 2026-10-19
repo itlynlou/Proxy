@@ -38,10 +38,16 @@ app.use((req, res, next) => {
 // own path then asks for /chat/completions or /models directly.
 app.use((req, res, next) => {
   if (/^\/(chat\/completions|models)(\?|$)/.test(req.url)) req.url = "/v1" + req.url;
+  // A POST to the bare base URL ("/v1" or "/") is a chat request from a client
+  // that posts to exactly the URL it was given (seen in the Vercel logs: a
+  // phone browser POSTing to /v1, which used to get a 404). Treat it as
+  // POST /v1/chat/completions. GET requests are unaffected.
+  if (req.method === "POST" && /^\/(v1\/?)?(\?|$)/.test(req.url)) {
+    const q = req.url.indexOf("?");
+    req.url = "/v1/chat/completions" + (q === -1 ? "" : req.url.slice(q));
+  }
   next();
 });
-
-app.use(express.json({ limit: "25mb" }));
 
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -50,6 +56,12 @@ app.use((req, res, next) => {
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
+
+// Body parsing comes AFTER the CORS headers on purpose. If it ran first, a
+// malformed or oversized JSON body would be rejected with an error reply that
+// has no CORS headers, and a browser reports that as "Network error or CORS
+// issue" instead of showing the real message.
+app.use(express.json({ limit: "25mb" }));
 
 const NIM_BASE = "https://integrate.api.nvidia.com/v1";
 
@@ -591,7 +603,68 @@ function buildErrorPayload(status, rawText) {
   };
 }
 
+// ---- Recent requests (for debugging) ---------------------------------------
+// Janitor AI and Lorebary only show a generic error, and Vercel's log does not
+// show NVIDIA's reply. This keeps the last 30 chat requests' METADATA (never
+// the prompt text) so you can open /debug/recent on your phone and see what
+// was asked, what each model attempt returned, and NVIDIA's own error text.
+// It lives in memory, so it only covers the currently running server instance
+// and is cleared by a redeploy or a long idle period.
+const recent = [];
+function recordRequest(entry) {
+  recent.unshift(entry);
+  if (recent.length > 30) recent.length = 30;
+}
+app.get("/debug/recent", (req, res) => {
+  res.json({
+    note: "Newest first. Metadata only, no prompt text. In-memory: covers only the currently running server instance and resets on redeploy or after idling.",
+    count: recent.length,
+    requests: recent,
+  });
+});
+
+// How long to wait for NVIDIA to START answering (the response headers)
+// before giving up on a model and trying the next one. Without this, a model
+// that is queued or stuck leaves the request hanging for minutes (one real
+// request on this deployment ran 2m39s) long after the browser or Lorebary
+// has given up, and the user only sees a network error. A streaming request
+// gets NVIDIA's headers right away once it is accepted, so it can use a
+// shorter limit; a non-streaming one only gets headers after the whole reply
+// is generated. All three can be overridden with env vars.
+const STREAM_FIRST_RESPONSE_MS = Number(process.env.NIM_FIRST_RESPONSE_MS) || 30000;
+const NONSTREAM_FIRST_RESPONSE_MS = Number(process.env.NIM_NONSTREAM_RESPONSE_MS) || 60000;
+const TOTAL_BUDGET_MS = Number(process.env.NIM_TOTAL_BUDGET_MS) || 90000;
+
+// One attempt against one model. Resolves to { response } once NVIDIA has
+// started answering, or { timedOut: true } if it did not within timeoutMs.
+// The caller hanging up (callerSignal) still cancels the request afterwards.
+async function callNim(candidate, reqBody, callerSignal, timeoutMs) {
+  const controller = new AbortController();
+  let timedOut = false;
+  if (callerSignal.aborted) controller.abort();
+  else callerSignal.addEventListener("abort", () => controller.abort(), { once: true });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  try {
+    const response = await fetchWithRetry(`${NIM_BASE}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${NIM_KEY}` },
+      body: JSON.stringify(buildNimBody(candidate, reqBody)),
+      signal: controller.signal,
+    });
+    return { response };
+  } catch (err) {
+    if (timedOut) return { timedOut: true };
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 app.post("/v1/chat/completions", async (req, res) => {
+  const startedAt = Date.now();
   if (!NIM_KEY) {
     return res.status(500).json({ error: { message: "Proxy misconfigured: NVIDIA_API_KEY env var is not set." } });
   }
@@ -615,6 +688,40 @@ app.post("/v1/chat/completions", async (req, res) => {
     }
     candidates.length = Math.min(candidates.length, 4);
   }
+
+  // Metadata for /debug/recent. Never contains the prompt text.
+  const meta = {
+    at: new Date().toISOString(),
+    requested_model: reqBody.model || null,
+    used_model: null,
+    stream: streaming,
+    messages: Array.isArray(reqBody.messages) ? reqBody.messages.length : 0,
+    approx_request_kb: Math.round(Number(req.headers["content-length"] || 0) / 1024),
+    max_tokens: reqBody.max_tokens ?? reqBody.max_completion_tokens ?? null,
+    sent_param_names: Object.keys(reqBody).filter((k) => k !== "messages").sort(),
+    caller: String(req.headers["user-agent"] || "").slice(0, 60),
+    attempts: [],
+    status: null,
+    note: null,
+    error: null,
+    ms: null,
+  };
+  let recorded = false;
+  const finishRecord = (status) => {
+    if (recorded) return;
+    recorded = true;
+    meta.status = status;
+    meta.ms = Date.now() - startedAt;
+    if (meta.error && status > 0 && status < 400) meta.note = "error text was delivered inside a 200 stream";
+    recordRequest(meta);
+    if (status === 0 || status >= 400 || meta.error) {
+      console.error(
+        "[chat problem]",
+        JSON.stringify({ requested: meta.requested_model, used: meta.used_model, status, ms: meta.ms, error: meta.error, attempts: meta.attempts })
+      );
+    }
+  };
+  res.on("finish", () => finishRecord(res.statusCode));
 
   // --- Connection handling -------------------------------------------
   // Callers like Lorebary (and Janitor's own backend) sit between the user
@@ -643,6 +750,8 @@ app.post("/v1/chat/completions", async (req, res) => {
     if (!res.writableFinished) {
       clientGone = true;
       abort.abort();
+      meta.error = meta.error || "caller disconnected before the reply finished";
+      finishRecord(0);
     }
   });
 
@@ -666,38 +775,66 @@ app.post("/v1/chat/completions", async (req, res) => {
   }
 
   try {
-    // Try each candidate until one is not "model unavailable" (404/410).
-    // Other failures (429, 5xx, auth) are returned as-is: they say nothing
-    // about whether the model itself exists.
+    // Try each candidate until one is neither "model unavailable" (404/410)
+    // nor too slow to start answering. Other failures (429, 5xx, auth) are
+    // returned as-is: they say nothing about whether the model itself exists.
+    const headerTimeoutMs = streaming ? STREAM_FIRST_RESPONSE_MS : NONSTREAM_FIRST_RESPONSE_MS;
     let upstream = null;
     let used = null;
-    let firstUnavailable = null;
+    let firstFailure = null;
     for (const candidate of candidates) {
-      const response = await fetchWithRetry(`${NIM_BASE}/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${NIM_KEY}` },
-        body: JSON.stringify(buildNimBody(candidate, reqBody)),
-        signal: abort.signal,
-      });
+      const remaining = TOTAL_BUDGET_MS - (Date.now() - startedAt);
+      if (firstFailure && remaining < 1000) break; // out of time budget: report what we have
+      const attemptStarted = Date.now();
+      const result = await callNim(candidate, reqBody, abort.signal, Math.max(500, Math.min(headerTimeoutMs, remaining)));
+      const attemptMs = Date.now() - attemptStarted;
+
+      if (result.timedOut) {
+        meta.attempts.push({ model: candidate.id, result: `no response within ${Math.round(attemptMs / 1000)}s`, ms: attemptMs });
+        console.warn(`[model too slow] ${candidate.id} gave no response within ${Math.round(attemptMs / 1000)}s`);
+        if (!firstFailure) firstFailure = { timedOut: true, candidate };
+        continue;
+      }
+
+      const response = result.response;
+      meta.attempts.push({ model: candidate.id, result: response.status, ms: attemptMs });
       if (response.ok || !MODEL_UNAVAILABLE_STATUSES.has(response.status)) {
         upstream = response;
         used = candidate;
         break;
       }
       console.warn(`[model unavailable] ${candidate.id} -> HTTP ${response.status}`);
-      if (!firstUnavailable) firstUnavailable = { response, candidate };
+      if (!firstFailure) firstFailure = { response, candidate };
       else await response.body?.cancel?.().catch(() => {});
     }
+
     if (!upstream) {
-      // Everything was unavailable: report the FIRST model's real error, not
-      // the last fallback's, since that's the one that was actually asked for.
-      upstream = firstUnavailable.response;
-      used = firstUnavailable.candidate;
-    } else if (firstUnavailable) {
-      await firstUnavailable.response.body?.cancel?.().catch(() => {});
-      console.warn(`[fallback] ${firstUnavailable.candidate.id} unavailable, answered by ${used.id}`);
+      if (firstFailure?.response) {
+        // Everything was unavailable: report the FIRST model's real error, not
+        // the last fallback's, since that's the one that was actually asked for.
+        upstream = firstFailure.response;
+        used = firstFailure.candidate;
+      } else {
+        stopHeartbeat();
+        meta.error = `no model started answering in time (${meta.attempts.map((a) => `${a.model}: ${a.result}`).join("; ")})`;
+        const payload = {
+          error: {
+            message:
+              `NVIDIA did not start answering within ${Math.round(headerTimeoutMs / 1000)}s. ` +
+              `Tried: ${meta.attempts.map((a) => a.model).join(", ")}. The models may be busy or down; try again, or open /status to see what answers.`,
+          },
+        };
+        if (!sseStarted) return res.status(504).json(payload);
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+    } else if (firstFailure) {
+      await firstFailure.response?.body?.cancel?.().catch(() => {});
+      console.warn(`[fallback] ${firstFailure.candidate.id} unavailable or too slow, answered by ${used.id}`);
     }
     stopHeartbeat();
+    meta.used_model = used.id;
     if (!res.headersSent) {
       res.setHeader("x-nim-model-used", used.id);
       if (used !== candidates[0]) res.setHeader("x-proxy-fallback-from", candidates[0].id);
@@ -706,12 +843,14 @@ app.post("/v1/chat/completions", async (req, res) => {
     if (!streaming) {
       const rawText = await upstream.text();
       if (!upstream.ok) {
+        meta.error = summarizeUpstreamError(rawText);
         return res.status(upstream.status).json(buildErrorPayload(upstream.status, rawText));
       }
       let data;
       try {
         data = rawText ? JSON.parse(rawText) : {};
       } catch {
+        meta.error = "NVIDIA returned 200 with an unparseable body";
         return res.status(502).json({
           error: { message: `NIM returned 200 with an unparseable body: ${rawText.slice(0, 300)}` },
         });
@@ -721,6 +860,7 @@ app.post("/v1/chat/completions", async (req, res) => {
 
     if (!upstream.ok) {
       const rawText = await upstream.text().catch(() => "");
+      meta.error = summarizeUpstreamError(rawText);
       const payload = buildErrorPayload(upstream.status, rawText);
       // Normal case: nothing sent yet, so return the real HTTP status.
       if (!sseStarted) return res.status(upstream.status).json(payload);
@@ -795,6 +935,7 @@ app.post("/v1/chat/completions", async (req, res) => {
   } catch (err) {
     stopHeartbeat();
     if (clientGone) return; // the caller hung up; nobody left to tell
+    meta.error = err.message;
     if (!res.headersSent) {
       res.status(502).json({ error: { message: `Failed to reach NVIDIA NIM: ${err.message}` } });
     } else {
