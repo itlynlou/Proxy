@@ -172,46 +172,9 @@ const MODEL_CONFIGS = {
     },
   },
 
-  // Kimi K3 (Moonshot AI) — confirmed real and free on NIM directly
-  // against NVIDIA's own API reference (docs.api.nvidia.com/nim/reference/
-  // moonshotai-kimi-k3) and Kimi's own docs. 2.8T total / 104B active
-  // params, native 1M-token context. Unlike the DeepSeek/GLM models
-  // above, thinking CANNOT be turned off — it's a thinking-only model —
-  // but reasoning depth is tunable via a top-level reasoning_effort field
-  // ("low"/"high"/"max", officially defaults to "max").
-  //
-  // Default here is "high", not "max" — Kimi's own docs note "max" on a
-  // model this size can take roughly a minute per response even on
-  // dedicated GPU clusters, which risks the exact Vercel-timeout failure
-  // mode DeepSeek-V4-Pro-0813 hit earlier. "low" is also offered for
-  // quick/simple messages where deep reasoning isn't needed.
-  //
-  // Known limitation, not fixable at the proxy level: Kimi K3 expects its
-  // own prior reasoning_content echoed back on every turn for best
-  // multi-turn quality. Janitor AI's client only stores/sends back plain
-  // `content`, with no concept of `reasoning_content` — so multi-turn
-  // conversations through Janitor AI will not get this optimization, and
-  // reasoning quality may drift over a long roleplay session. This is a
-  // limitation of Janitor AI's client shape, not something this proxy
-  // can transparently work around.
-  "kimi-k3-thinking": {
-    id: "moonshotai/kimi-k3",
-    mode: "kwargs",
-    forceThinking: true,
-    kwargsOn: { reasoning_effort: "high" },
-  },
-  "kimi-k3-max": {
-    id: "moonshotai/kimi-k3",
-    mode: "kwargs",
-    forceThinking: true,
-    kwargsOn: { reasoning_effort: "max" },
-  },
-  "kimi-k3-fast": {
-    id: "moonshotai/kimi-k3",
-    mode: "kwargs",
-    forceThinking: true,
-    kwargsOn: { reasoning_effort: "low" },
-  },
+  // REMOVED: kimi-k3*. NVIDIA retired moonshotai/kimi-k3 on 2026-10-15. Its own
+  // reply is "The model 'moonshotai/kimi-k3' has reached its end of life ... and
+  // is no longer available" (HTTP 410).
 
   // GLM-5.3 (Z.ai) — confirmed real and free on NIM directly against
   // NVIDIA's own API reference (docs.api.nvidia.com/nim/reference/
@@ -322,7 +285,7 @@ const MODEL_CONFIGS = {
 
 // Used when the requested name isn't recognized (e.g. an old alias saved in
 // Janitor AI). Must be a model that is actually being served.
-const DEFAULT_MODEL = "deepseek-v4.1-flash-thinking";
+const DEFAULT_MODEL = "glm-5.3-thinking";
 
 // If a curated model answers 404 or 410 (retired / not served for this
 // account), the proxy retries with these, in order, instead of failing the
@@ -333,7 +296,7 @@ const MODEL_UNAVAILABLE_STATUSES = new Set([404, 410]);
 const FALLBACK_MODELS = (
   process.env.NIM_FALLBACK_MODELS
     ? process.env.NIM_FALLBACK_MODELS.split(",").map((k) => k.trim())
-    : ["deepseek-v4.1-flash-thinking", "glm-5.3-flash-thinking", "nemotron-omni-30b-thinking", "kimi-k3-thinking"]
+    : ["glm-5.3-thinking", "nemotron-omni-30b-thinking", "deepseek-v4.1-flash-thinking", "glm-5.3-flash-thinking"]
 ).filter((key) => MODEL_CONFIGS[key]);
 
 // Any model NOT in MODEL_CONFIGS is treated as a raw NIM model id and
@@ -497,7 +460,7 @@ app.get("/status", async (req, res) => {
   }
   const fresh = queryOf(req.url).get("fresh") === "1";
   if (!fresh && statusCache.data && Date.now() - statusCache.at < STATUS_TTL_MS) {
-    return res.json({ ...statusCache.data, cached: true });
+    return res.json({ ...statusCache.data, avoided_by_proxy_now: currentlyAvoided(), cached: true });
   }
 
   // One probe per distinct upstream model id, not per alias.
@@ -521,6 +484,11 @@ app.get("/status", async (req, res) => {
           signal: controller.signal,
         });
         const text = await r.text().catch(() => "");
+        if (r.ok) clearModelMark(id);
+        else {
+          const kind = classifyFailure(r.status, text);
+          if (kind) markModel(id, kind, summarizeUpstreamError(text));
+        }
         return {
           model: id,
           aliases,
@@ -530,6 +498,7 @@ app.get("/status", async (req, res) => {
           ms: Date.now() - started,
         };
       } catch (err) {
+        if (err.name === "AbortError") markModel(id, "timeout", "no answer within 20s");
         return {
           model: id,
           aliases,
@@ -549,6 +518,7 @@ app.get("/status", async (req, res) => {
     working_aliases: results.filter((r) => r.ok).flatMap((r) => r.aliases),
     not_working: results.filter((r) => !r.ok).map((r) => ({ model: r.model, status: r.status, detail: r.detail })),
     results,
+    avoided_by_proxy_now: currentlyAvoided(),
   };
   statusCache = { at: Date.now(), data };
   res.json({ ...data, cached: false });
@@ -619,6 +589,7 @@ app.get("/debug/recent", (req, res) => {
   res.json({
     note: "Newest first. Metadata only, no prompt text. In-memory: covers only the currently running server instance and resets on redeploy or after idling.",
     count: recent.length,
+    currently_avoided: currentlyAvoided(),
     requests: recent,
   });
 });
@@ -631,9 +602,44 @@ app.get("/debug/recent", (req, res) => {
 // gets NVIDIA's headers right away once it is accepted, so it can use a
 // shorter limit; a non-streaming one only gets headers after the whole reply
 // is generated. All three can be overridden with env vars.
-const STREAM_FIRST_RESPONSE_MS = Number(process.env.NIM_FIRST_RESPONSE_MS) || 30000;
+const STREAM_FIRST_RESPONSE_MS = Number(process.env.NIM_FIRST_RESPONSE_MS) || 20000;
 const NONSTREAM_FIRST_RESPONSE_MS = Number(process.env.NIM_NONSTREAM_RESPONSE_MS) || 60000;
 const TOTAL_BUDGET_MS = Number(process.env.NIM_TOTAL_BUDGET_MS) || 90000;
+
+// ---- Remembering which models are down --------------------------------------
+// Without memory, every request re-tried the dead models first: two models that
+// never answer cost 30 seconds EACH on every single request (seen in
+// /debug/recent: about a minute before a working model even started), and a
+// retired model was hit again every time. So when a model fails in a way that
+// says "it is down", remember that for a while and skip it. The memory lives in
+// this server instance only; opening /status?fresh=1 re-tests every model and
+// clears the marks of the ones that answer. NIM_MODEL_MEMORY=off disables it.
+const MODEL_MEMORY_ENABLED = process.env.NIM_MODEL_MEMORY !== "off";
+const MODEL_MEMORY_MS = { unavailable: 60 * 60 * 1000, timeout: 5 * 60 * 1000, busy: 30 * 1000 };
+const modelHealth = new Map(); // upstream model id -> { kind, until, detail }
+
+function markModel(id, kind, detail) {
+  if (!MODEL_MEMORY_ENABLED || !MODEL_MEMORY_MS[kind]) return;
+  modelHealth.set(id, { kind, until: Date.now() + MODEL_MEMORY_MS[kind], detail: String(detail || "").slice(0, 160) });
+}
+function clearModelMark(id) {
+  modelHealth.delete(id);
+}
+function modelMark(id) {
+  const mark = modelHealth.get(id);
+  if (!mark) return null;
+  if (mark.until <= Date.now()) {
+    modelHealth.delete(id);
+    return null;
+  }
+  return mark;
+}
+function currentlyAvoided() {
+  const now = Date.now();
+  return [...modelHealth.entries()]
+    .filter(([, m]) => m.until > now)
+    .map(([model, m]) => ({ model, kind: m.kind, seconds_left: Math.round((m.until - now) / 1000), detail: m.detail }));
+}
 
 // NVIDIA answers "ResourceExhausted: Worker local total request limit reached
 // (16/16)" / "All workers are busy" when every worker serving ONE model is
@@ -726,18 +732,25 @@ app.post("/v1/chat/completions", async (req, res) => {
   // Candidate models, in order. A hand-typed raw "vendor/model" id gets just
   // itself; a curated alias (or an unrecognized name that fell back to the
   // default) is followed by the fallback chain, deduplicated by upstream id.
-  const candidates = [config];
+  // Models this server saw fail a moment ago (see "Remembering which models
+  // are down") are skipped, so only the first request after a failure pays the
+  // wait. If everything is marked down, try them all anyway.
+  const everyCandidate = [config];
   if (config.mode !== "passthrough") {
     const seenIds = new Set([config.id]);
     for (const key of FALLBACK_MODELS) {
       const candidate = { key, ...MODEL_CONFIGS[key] };
       if (!seenIds.has(candidate.id)) {
         seenIds.add(candidate.id);
-        candidates.push(candidate);
+        everyCandidate.push(candidate);
       }
     }
-    candidates.length = Math.min(candidates.length, 4);
   }
+  const healthyCandidates = everyCandidate.filter((c) => !modelMark(c.id));
+  const avoided = everyCandidate
+    .filter((c) => modelMark(c.id))
+    .map((c) => ({ model: c.id, kind: modelMark(c.id).kind, seconds_left: Math.round((modelMark(c.id).until - Date.now()) / 1000) }));
+  const candidates = (healthyCandidates.length ? healthyCandidates : everyCandidate).slice(0, 4);
 
   // Metadata for /debug/recent. Never contains the prompt text.
   const meta = {
@@ -750,6 +763,7 @@ app.post("/v1/chat/completions", async (req, res) => {
     max_tokens: reqBody.max_tokens ?? reqBody.max_completion_tokens ?? null,
     sent_param_names: Object.keys(reqBody).filter((k) => k !== "messages").sort(),
     caller: String(req.headers["user-agent"] || "").slice(0, 60),
+    avoided,
     attempts: [],
     status: null,
     note: null,
@@ -843,6 +857,7 @@ app.post("/v1/chat/completions", async (req, res) => {
         ...(rawText ? { detail: summarizeUpstreamError(rawText) } : {}),
       });
       console.warn(`[model ${kind}] ${candidate.id} -> ${label}`);
+      markModel(candidate.id, kind, rawText ? summarizeUpstreamError(rawText) : label);
       if (!firstFailure) firstFailure = { candidate, kind, status, rawText };
     };
 
@@ -943,9 +958,10 @@ app.post("/v1/chat/completions", async (req, res) => {
     }
     stopHeartbeat();
     meta.used_model = used.id;
+    if (upstream.ok) clearModelMark(used.id);
     if (!res.headersSent) {
       res.setHeader("x-nim-model-used", used.id);
-      if (used !== candidates[0]) res.setHeader("x-proxy-fallback-from", candidates[0].id);
+      if (used.id !== config.id) res.setHeader("x-proxy-fallback-from", config.id);
     }
 
     if (!streaming) {

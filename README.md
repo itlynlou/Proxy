@@ -50,9 +50,6 @@ rewrite. If you ever see `Cannot POST /api` again after this fix, the
 | `deepseek-v4.1-flash-max` | always on, effort 100 | most thorough — untested at this setting in practice, see caveat below |
 | `deepseek-v4.1-flash-fast` | always on, effort 25 | quickest option |
 | `deepseek-v4.1-flash` | effort 50 by default, respects `thinking:false` override | same model, can be fully disabled unlike the other variants |
-| `kimi-k3-thinking` | always on, `reasoning_effort: high` (can't be disabled) | 2.8T/104B active, 1M context — see multi-turn caveat below |
-| `kimi-k3-max` | always on, `reasoning_effort: max` | most thorough, risks the same Vercel timeout DeepSeek-Pro-max hit |
-| `kimi-k3-fast` | always on, `reasoning_effort: low` | quickest option for simple messages |
 | `glm-5.3-thinking` | always on, `reasoning_effort: high` (can't be disabled) | 753B MoE, 1M context. NIM has been returning an empty 404 for this model (NVIDIA-side, not a proxy bug) |
 | `glm-5.3-max` | always on, `reasoning_effort: max` | most thorough — may hit the same Vercel timeout risk as DeepSeek-Pro-max |
 | `glm-5.3-fast` | always on, `reasoning_effort: low` | quickest option |
@@ -71,7 +68,7 @@ models above get that normalization). See the full live catalog:
 curl https://your-project-name.vercel.app/v1/models
 ```
 
-Default if you send an unrecognized model name (including the removed `nemotron-*` names): `deepseek-v4.1-flash-thinking`. This default is not guaranteed to be up either, which is why the automatic fallback below exists.
+Default if you send an unrecognized model name (including the removed `nemotron-*` names): `glm-5.3-thinking`. This default is not guaranteed to be up either, which is why the automatic fallback below exists.
 
 ## How thinking mode actually works here
 
@@ -144,20 +141,11 @@ id from NVIDIA's catalog (anything with a `/`, like `vendor/model-name`):
 those pass straight through with no thinking handling. Check `/status`
 and the catalog first, since retired ids answer 410.
 
-## Kimi K3's multi-turn limitation (can't be fixed at the proxy level)
+## Kimi K3 is gone
 
-Kimi K3 is designed to receive its own previous `reasoning_content` back
-on every turn of a conversation — without it, Moonshot's own docs note
-reasoning quality degrades over a multi-turn session. Janitor AI's client
-only ever sends and stores plain `content`; it has no concept of
-`reasoning_content` at all, so it can't echo something it never receives
-in a form it recognizes. This proxy strips reasoning into a visible
-`<think>` block specifically so *you* can see it, but that's a display
-choice — it doesn't reconstruct the original structured field Kimi wants
-back. Practically: expect Kimi K3's reasoning quality in Janitor AI to
-hold up fine for shorter exchanges, but potentially drift on very long
-roleplay sessions. This is a limitation of what Janitor AI's client
-sends, not something fixable by changing this proxy's code.
+NVIDIA retired `moonshotai/kimi-k3` on 2026-10-15 (its own reply: "has reached
+its end of life ... and is no longer available", HTTP 410), so the `kimi-k3*`
+models were removed. A saved Kimi name now goes to the default model.
 
 ## Retired models (HTTP 410), automatic fallback, and `/status`
 
@@ -175,9 +163,9 @@ names saved, it lands on the default model instead of an error.
 What the proxy does about this now:
 
 - **Automatic fallback.** If a named model answers 404 or 410, the proxy
-  tries the next one in this order: `deepseek-v4.1-flash-thinking`,
-  `glm-5.3-flash-thinking`, `nemotron-omni-30b-thinking`,
-  `kimi-k3-thinking` (at most 4 attempts). Each fallback model gets its
+  tries the next one in this order: `glm-5.3-thinking`,
+  `nemotron-omni-30b-thinking`, `deepseek-v4.1-flash-thinking`,
+  `glm-5.3-flash-thinking` (at most 4 attempts). Each fallback model gets its
   own correct request settings. A raw `vendor/model` id you typed yourself
   is never swapped: you get that model or its real error. If every
   candidate fails, you get the real error of the model you asked for.
@@ -200,8 +188,36 @@ Things to know:
   fallback and `/status` logic are tested against a mock server, and the
   retirement dates come from NVIDIA developer-forum posts and a public
   probe of NVIDIA's endpoint, not from my own check. I also have not seen
-  the DeepSeek, GLM-Flash, omni or Kimi models answer for your key. `/status`
+  the DeepSeek, GLM-Flash or omni models answer for your key. `/status`
   is how you find out which ones do.
+
+## Remembering which models are down
+
+On 2026-10-20 a `/status` check showed `glm-5.3-flash` and `deepseek-v4.1-flash`
+not answering at all, `kimi-k3` retired, `nemotron-omni` answering but
+sometimes saturated (one busy reply said 3018/16), and `glm-5.3` answering.
+`/debug/recent` showed the proxy spending 30 seconds on each dead model on
+every single request, about a minute before a working model even started, and
+a 90-second 504 on a test request.
+
+Now the proxy remembers what just failed and skips it: a retired model (404 or
+410) for an hour, a model that did not answer in time for 5 minutes, a busy
+one for 30 seconds. Only the first request after a failure pays the wait.
+Skipped models are listed under `currently_avoided` in `/debug/recent` and
+`avoided_by_proxy_now` in `/status`. Opening `/status?fresh=1` re-tests every
+model and clears the marks of the ones that answer. If every model is marked
+down, the proxy tries them all anyway. Turn the memory off with
+`NIM_MODEL_MEMORY=off`.
+
+Trade-offs: a model that is merely slow (not dead) can be skipped for 5
+minutes after one slow reply, and the memory is per server instance, so a
+redeploy or a cold start forgets it. The proxy only tracks NVIDIA as it is
+today. These models change often, and `/status` is how you see what answers.
+
+Other changes made together with this: the fallback chain now starts with
+`glm-5.3-thinking`, the default for unrecognized names is `glm-5.3-thinking`
+(it was DeepSeek V4.1 Flash, which was not answering), and the wait for a
+streaming reply to start is now 20 seconds.
 
 ## "ResourceExhausted: Worker local total request limit reached (16/16)"
 
@@ -245,7 +261,7 @@ log shows it isn't what limits you).
 
 What changed:
 
-- **A time limit for NVIDIA to start answering**: 30 seconds for streaming
+- **A time limit for NVIDIA to start answering**: 20 seconds for streaming
   requests, 60 for non-streaming, 90 in total across models. If a model
   doesn't start in time, the proxy moves on to the next model in the
   fallback chain. If nothing answers, you get a clear JSON 504 naming what
