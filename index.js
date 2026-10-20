@@ -635,6 +635,56 @@ const STREAM_FIRST_RESPONSE_MS = Number(process.env.NIM_FIRST_RESPONSE_MS) || 30
 const NONSTREAM_FIRST_RESPONSE_MS = Number(process.env.NIM_NONSTREAM_RESPONSE_MS) || 60000;
 const TOTAL_BUDGET_MS = Number(process.env.NIM_TOTAL_BUDGET_MS) || 90000;
 
+// NVIDIA answers "ResourceExhausted: Worker local total request limit reached
+// (16/16)" / "All workers are busy" when every worker serving ONE model is
+// occupied. That is capacity pressure on that model, not a problem with the
+// request or your account, so the right response is to switch models at once
+// rather than retry the same one.
+const BUSY_PATTERN = /ResourceExhausted|All workers are busy|total request limit|overloaded|at capacity/i;
+
+// Classifies a failed NVIDIA reply:
+//  "unavailable" - the model is retired or not served (404, 410)
+//  "busy"        - 503, or a 500/502 whose body says the workers are saturated
+//  null          - anything else (400, 401, 429, other 5xx...): returned to the
+//                  caller untouched, since switching models would not help.
+//                  429 in particular is a rate limit on your key across models.
+function classifyFailure(status, rawText) {
+  if (MODEL_UNAVAILABLE_STATUSES.has(status)) return "unavailable";
+  if (status === 503) return "busy";
+  if ((status === 500 || status === 502) && BUSY_PATTERN.test(rawText || "")) return "busy";
+  return null;
+}
+
+// Reads a streaming reply just far enough to see its first "data:" line, so a
+// busy error delivered INSIDE the stream can still trigger a model switch
+// before anything reaches the client. Nothing is lost: the text read so far is
+// handed to the normal forwarding loop. Also bounds the wait for that first
+// event. Returns { reader, decoder, buffer, firstData } or { timedOut: true }.
+async function primeStream(response, timeoutMs) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let timer;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  try {
+    while (true) {
+      const next = await Promise.race([reader.read(), deadline]);
+      if (next === null) {
+        reader.cancel().catch(() => {});
+        return { timedOut: true };
+      }
+      if (next.done) return { reader, decoder, buffer, firstData: null };
+      buffer += decoder.decode(next.value, { stream: true });
+      const dataLine = buffer.split("\n").slice(0, -1).find((l) => l.startsWith("data:"));
+      if (dataLine) return { reader, decoder, buffer, firstData: dataLine.slice(5).trim() };
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // One attempt against one model. Resolves to { response } once NVIDIA has
 // started answering, or { timedOut: true } if it did not within timeoutMs.
 // The caller hanging up (callerSignal) still cancels the request afterwards.
@@ -775,63 +825,121 @@ app.post("/v1/chat/completions", async (req, res) => {
   }
 
   try {
-    // Try each candidate until one is neither "model unavailable" (404/410)
-    // nor too slow to start answering. Other failures (429, 5xx, auth) are
-    // returned as-is: they say nothing about whether the model itself exists.
+    // Try each candidate until one is not "unavailable" (404/410), not "busy"
+    // (see classifyFailure), and not too slow to start answering. Every other
+    // failure is returned as-is: it says nothing about whether switching
+    // models would help.
     const headerTimeoutMs = streaming ? STREAM_FIRST_RESPONSE_MS : NONSTREAM_FIRST_RESPONSE_MS;
     let upstream = null;
     let used = null;
+    let primedStream = null;
     let firstFailure = null;
+    const noteFailure = (candidate, kind, status, rawText, attemptMs, label) => {
+      meta.attempts.push({
+        model: candidate.id,
+        result: label,
+        kind,
+        ms: attemptMs,
+        ...(rawText ? { detail: summarizeUpstreamError(rawText) } : {}),
+      });
+      console.warn(`[model ${kind}] ${candidate.id} -> ${label}`);
+      if (!firstFailure) firstFailure = { candidate, kind, status, rawText };
+    };
+
     for (const candidate of candidates) {
-      const remaining = TOTAL_BUDGET_MS - (Date.now() - startedAt);
+      let remaining = TOTAL_BUDGET_MS - (Date.now() - startedAt);
       if (firstFailure && remaining < 1000) break; // out of time budget: report what we have
       const attemptStarted = Date.now();
       const result = await callNim(candidate, reqBody, abort.signal, Math.max(500, Math.min(headerTimeoutMs, remaining)));
-      const attemptMs = Date.now() - attemptStarted;
 
       if (result.timedOut) {
-        meta.attempts.push({ model: candidate.id, result: `no response within ${Math.round(attemptMs / 1000)}s`, ms: attemptMs });
-        console.warn(`[model too slow] ${candidate.id} gave no response within ${Math.round(attemptMs / 1000)}s`);
-        if (!firstFailure) firstFailure = { timedOut: true, candidate };
+        const ms = Date.now() - attemptStarted;
+        noteFailure(candidate, "timeout", 504, "", ms, `no response within ${Math.round(ms / 1000)}s`);
         continue;
       }
 
       const response = result.response;
-      meta.attempts.push({ model: candidate.id, result: response.status, ms: attemptMs });
-      if (response.ok || !MODEL_UNAVAILABLE_STATUSES.has(response.status)) {
+      if (!response.ok) {
+        const rawText = await response.text().catch(() => "");
+        const kind = classifyFailure(response.status, rawText);
+        if (kind) {
+          noteFailure(candidate, kind, response.status, rawText, Date.now() - attemptStarted, `HTTP ${response.status} (${kind})`);
+          continue;
+        }
+        // Not a "try another model" failure: hand it back untouched.
+        meta.attempts.push({ model: candidate.id, result: response.status, ms: Date.now() - attemptStarted });
+        upstream = new Response(rawText, { status: response.status });
+        used = candidate;
+        break;
+      }
+
+      if (!streaming) {
+        meta.attempts.push({ model: candidate.id, result: response.status, ms: Date.now() - attemptStarted });
         upstream = response;
         used = candidate;
         break;
       }
-      console.warn(`[model unavailable] ${candidate.id} -> HTTP ${response.status}`);
-      if (!firstFailure) firstFailure = { response, candidate };
-      else await response.body?.cancel?.().catch(() => {});
+
+      // Streaming: look at the first event before committing to this model.
+      remaining = TOTAL_BUDGET_MS - (Date.now() - startedAt);
+      const primed = await primeStream(response, Math.max(500, Math.min(headerTimeoutMs, remaining)));
+      if (primed.timedOut) {
+        const ms = Date.now() - attemptStarted;
+        noteFailure(candidate, "timeout", 504, "", ms, `accepted the request but sent no data within ${Math.round(ms / 1000)}s`);
+        continue;
+      }
+      if (primed.firstData && BUSY_PATTERN.test(primed.firstData) && !/"choices"/.test(primed.firstData)) {
+        primed.reader.cancel().catch(() => {});
+        noteFailure(candidate, "busy", 503, primed.firstData, Date.now() - attemptStarted, "busy (error sent inside the stream)");
+        continue;
+      }
+      meta.attempts.push({ model: candidate.id, result: response.status, ms: Date.now() - attemptStarted });
+      upstream = response;
+      used = candidate;
+      primedStream = primed;
+      break;
     }
 
     if (!upstream) {
-      if (firstFailure?.response) {
-        // Everything was unavailable: report the FIRST model's real error, not
-        // the last fallback's, since that's the one that was actually asked for.
-        upstream = firstFailure.response;
-        used = firstFailure.candidate;
+      stopHeartbeat();
+      const tried = meta.attempts.map((a) => a.model).join(", ");
+      let status;
+      let payload;
+      if (firstFailure.kind === "unavailable") {
+        // The model you asked for is gone: report ITS real error, not a fallback's.
+        status = firstFailure.status;
+        payload = buildErrorPayload(firstFailure.status, firstFailure.rawText);
+        meta.error = summarizeUpstreamError(firstFailure.rawText);
+      } else if (firstFailure.kind === "busy") {
+        status = 503;
+        payload = {
+          error: {
+            message:
+              `NVIDIA's servers are busy: every worker for these models is occupied right now ` +
+              `(NVIDIA says: ${summarizeUpstreamError(firstFailure.rawText)}). Tried: ${tried}. Wait a few seconds and try again.`,
+          },
+        };
+        meta.error = `all models busy (${tried})`;
       } else {
-        stopHeartbeat();
-        meta.error = `no model started answering in time (${meta.attempts.map((a) => `${a.model}: ${a.result}`).join("; ")})`;
-        const payload = {
+        status = 504;
+        payload = {
           error: {
             message:
               `NVIDIA did not start answering within ${Math.round(headerTimeoutMs / 1000)}s. ` +
-              `Tried: ${meta.attempts.map((a) => a.model).join(", ")}. The models may be busy or down; try again, or open /status to see what answers.`,
+              `Tried: ${tried}. The models may be busy or down; try again, or open /status to see what answers.`,
           },
         };
-        if (!sseStarted) return res.status(504).json(payload);
-        res.write(`data: ${JSON.stringify(payload)}\n\n`);
-        res.write("data: [DONE]\n\n");
-        return res.end();
+        meta.error = `no model started answering in time (${meta.attempts.map((a) => `${a.model}: ${a.result}`).join("; ")})`;
       }
+      if (!sseStarted) {
+        if (status === 503) res.setHeader("Retry-After", "5");
+        return res.status(status).json(payload);
+      }
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      res.write("data: [DONE]\n\n");
+      return res.end();
     } else if (firstFailure) {
-      await firstFailure.response?.body?.cancel?.().catch(() => {});
-      console.warn(`[fallback] ${firstFailure.candidate.id} unavailable or too slow, answered by ${used.id}`);
+      console.warn(`[fallback] ${firstFailure.candidate.id} was ${firstFailure.kind}, answered by ${used.id}`);
     }
     stopHeartbeat();
     meta.used_model = used.id;
@@ -878,59 +986,65 @@ app.post("/v1/chat/completions", async (req, res) => {
     // Janitor AI's side it's just one continuous text stream.
     startSse();
 
-    const reader = upstream.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
+    const { reader, decoder } = primedStream;
+    let buffer = primedStream.buffer; // whatever was read while checking the first event
     let sentOpenTag = false;
     let sentCloseTag = false;
 
+    const emitLine = (line) => {
+      if (!line.startsWith("data: ")) {
+        res.write(line + "\n");
+        return;
+      }
+      const payload = line.slice(6);
+      if (payload === "[DONE]") {
+        res.write(`data: [DONE]\n\n`);
+        return;
+      }
+      let chunk;
+      try {
+        chunk = JSON.parse(payload);
+      } catch {
+        res.write(line + "\n");
+        return;
+      }
+
+      const delta = chunk.choices?.[0]?.delta;
+      if (delta) {
+        const reasoningPiece = delta.reasoning_content || delta.reasoning || delta.thinking;
+        if (reasoningPiece) {
+          let text = reasoningPiece;
+          if (!sentOpenTag) {
+            text = "<think>\n" + text;
+            sentOpenTag = true;
+          }
+          delta.content = text;
+          delete delta.reasoning_content;
+          delete delta.reasoning;
+          delete delta.thinking;
+        } else if (delta.content && sentOpenTag && !sentCloseTag) {
+          delta.content = "\n</think>\n\n" + delta.content;
+          sentCloseTag = true;
+        }
+      }
+
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    };
+
+    const drain = () => {
+      const lines = buffer.split("\n");
+      buffer = lines.pop(); // keep the last, possibly incomplete line
+      for (const line of lines) emitLine(line);
+    };
+
+    drain();
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop(); // keep the last, possibly incomplete line
-
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) {
-          res.write(line + "\n");
-          continue;
-        }
-        const payload = line.slice(6);
-        if (payload === "[DONE]") {
-          res.write(`data: [DONE]\n\n`);
-          continue;
-        }
-        let chunk;
-        try {
-          chunk = JSON.parse(payload);
-        } catch {
-          res.write(line + "\n");
-          continue;
-        }
-
-        const delta = chunk.choices?.[0]?.delta;
-        if (delta) {
-          const reasoningPiece = delta.reasoning_content || delta.reasoning || delta.thinking;
-          if (reasoningPiece) {
-            let text = reasoningPiece;
-            if (!sentOpenTag) {
-              text = "<think>\n" + text;
-              sentOpenTag = true;
-            }
-            delta.content = text;
-            delete delta.reasoning_content;
-            delete delta.reasoning;
-            delete delta.thinking;
-          } else if (delta.content && sentOpenTag && !sentCloseTag) {
-            delta.content = "\n</think>\n\n" + delta.content;
-            sentCloseTag = true;
-          }
-        }
-
-        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-      }
+      drain();
     }
+    if (buffer.trim()) emitLine(buffer); // a final line that had no trailing newline
     res.end();
   } catch (err) {
     stopHeartbeat();

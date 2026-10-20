@@ -203,6 +203,37 @@ Things to know:
   the DeepSeek, GLM-Flash, omni or Kimi models answer for your key. `/status`
   is how you find out which ones do.
 
+## "ResourceExhausted: Worker local total request limit reached (16/16)"
+
+This is NVIDIA saying every worker serving that one model is busy (16 of 16
+slots in use). It is capacity pressure on NVIDIA's shared free servers, not a
+problem with your request, your key, or this proxy. Other projects report the
+same message for several NVIDIA models, DeepSeek V4 Flash among them. Reports
+say NVIDIA sends it as an HTTP 500 or 503, and at least one project has seen
+it arrive as text inside the stream. Until now this proxy handed that message
+straight to you, which is what showed up as the chat message in Janitor.
+
+What the proxy does now: it treats a 503, a 500/502 whose body names the
+saturation, and the same text arriving as the **first event of a stream** as
+"this model is busy right now", and switches to the next model in the
+fallback chain at once, with no waiting or retrying on the busy one. If every
+model is busy you get a clear 503 saying so (with `Retry-After: 5`) instead of
+NVIDIA's raw text.
+
+Things to know:
+
+- A **429** is deliberately not handled this way. That is a rate limit on your
+  key across all models, so switching models would not help and would add
+  requests.
+- It cannot switch models once a reply has **already started streaming**,
+  because text has already gone to the client. It only checks the first event.
+- When it switches, a different model answers. See `x-nim-model-used` or
+  `/debug/recent`.
+- If all the models in the chain are busy at once (peak hours), nothing in the
+  proxy can create capacity. Wait a moment and retry.
+- This is built from reports by NVIDIA developers and other projects plus a
+  mock server. I have not been able to reproduce NVIDIA's busy state myself.
+
 ## When a reply hangs or fails: time limits, slow-model fallback, `/debug/recent`
 
 One real request on this deployment ran **2 minutes 39 seconds** and ended
